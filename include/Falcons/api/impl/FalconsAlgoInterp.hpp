@@ -16,6 +16,7 @@
 #endif
 
 #include <cstdlib>
+#include <memory>
 #include "Falcons/encoder/RleFseEncoder.hpp"
 #include "Falcons/api/impl/FalconsAlgoLorenzoReg.hpp"
 #include "Falcons/decomposition/BlockwiseDecomposition.hpp"
@@ -100,65 +101,54 @@ template <class T, uint N>
 double interp_compress_test(
     const std::vector<std::vector<T>> &sampled_blocks, const Config &conf, int block_size, uchar *cmpData,
     size_t cmpCap) {  // test interp cmp on a set of sampled data blocks and return the compression ratio
-    // std::vector<std::vector<int> > quant_inds_vec(sampled_blocks.size());
-    int16_t** quant_inds = new int16_t*[sampled_blocks.size()];
-    uint64_t* quant_inds_size = new uint64_t[sampled_blocks.size()];
-    std::vector<std::vector<T> > unpred_vec(sampled_blocks.size());
-    // #ifdef _OPENMP
-    // #pragma omp parallel for
-    // #endif
-    // for (size_t k = 0; k < sampled_blocks.size(); ++k) {
-    //     unpred_buffer[k] = new uchar[sampled_blocks.size() * sizeof(T)
-    //         * std::accumulate(conf.dims.begin(), conf.dims.end(), 1, std::multiplies<size_t>())];
-    //     unpred_buffer_pos[k] = unpred_buffer[k];
-    // }
     size_t sample_size = sampled_blocks.size();
+    std::vector<std::unique_ptr<int16_t[]>> quant_inds(sample_size);
+    std::vector<uint64_t> quant_inds_size(sample_size);
+    std::vector<std::vector<T>> unpred_vec(sample_size);
     #ifdef _OPENMP
-    #pragma omp parallel for if(conf.openmp)
+    #pragma omp parallel if(conf.openmp)
     #endif
-    for (size_t k = 0; k < sample_size; ++k) {
-        auto falcons =
-            make_decomposition_interpolation<TUNING::ENABLED, T, N>(conf, LinearQuantizer<T>(conf.absErrorBound, conf.quantbinCnt / 2));
-        auto cur_block = sampled_blocks[k];
-        std::tie(quant_inds[k], quant_inds_size[k]) = falcons.compress(conf, cur_block.data());
-        unpred_vec[k] = falcons.test_unpred();
+    {
+        // Compression reconstructs in place; restore a private copy for every task.
+        std::vector<T> cur_block;
+        #ifdef _OPENMP
+        #pragma omp for
+        #endif
+        for (size_t k = 0; k < sample_size; ++k) {
+            auto falcons = make_decomposition_interpolation<TUNING::ENABLED, T, N>(
+                conf, LinearQuantizer<T>(conf.absErrorBound, conf.quantbinCnt / 2));
+            cur_block.assign(sampled_blocks[k].begin(), sampled_blocks[k].end());
+            auto [indices, count] = falcons.compress(conf, cur_block.data());
+            quant_inds[k].reset(indices);
+            quant_inds_size[k] = count;
+            unpred_vec[k].swap(falcons.test_unpred());
+        }
     }
-    std::vector<size_t> prefix_sum(sample_size << 1);
     size_t cur_size = 0;
-    for (size_t k = 0; k < sample_size << 1; ++k) {
-        prefix_sum[k] = cur_size;
-        if(k < sample_size) {
-            cur_size += unpred_vec[k].size() * sizeof(T);
-        }
-        else {
-            cur_size += quant_inds_size[k - sample_size] * sizeof(int16_t);
-        }
+    for (size_t k = 0; k < sample_size; ++k) {
+        cur_size += unpred_vec[k].size() * sizeof(T);
     }
-    uchar* buffer = new uchar[cur_size];
-    for (size_t k = 0; k < sample_size << 1; ++k) {
-        if(k < sample_size) {
-            if (!unpred_vec[k].empty())
-                memcpy(buffer + prefix_sum[k], reinterpret_cast<const uchar*>(unpred_vec[k].data()), unpred_vec[k].size() * sizeof(T));
-        }
-        else {
-            memcpy(buffer + prefix_sum[k], reinterpret_cast<const uchar*>(quant_inds[k - sample_size]), quant_inds_size[k - sample_size] * sizeof(int16_t));
-        }
+    for (size_t k = 0; k < sample_size; ++k) {
+        cur_size += quant_inds_size[k] * sizeof(int16_t);
+    }
+    std::unique_ptr<uchar[]> buffer(new uchar[cur_size]);
+    size_t offset = 0;
+    // Scoring layout: all unpredictable blocks, then all quantization blocks.
+    for (size_t k = 0; k < sample_size; ++k) {
+        size_t bytes = unpred_vec[k].size() * sizeof(T);
+        if (bytes != 0) memcpy(buffer.get() + offset, unpred_vec[k].data(), bytes);
+        offset += bytes;
+    }
+    for (size_t k = 0; k < sample_size; ++k) {
+        size_t bytes = quant_inds_size[k] * sizeof(int16_t);
+        if (bytes != 0) memcpy(buffer.get() + offset, quant_inds[k].get(), bytes);
+        offset += bytes;
     }
     auto lossless = Lossless_zstd();
-    auto cmpSize = lossless.compress(buffer, cur_size, cmpData, cmpCap);
+    auto cmpSize = lossless.compress(buffer.get(), cur_size, cmpData, cmpCap);
 
     auto compression_ratio = conf.num * sampled_blocks.size() * sizeof(T) * 1.0 / cmpSize;
     
-    #ifdef _OPENMP
-    #pragma omp parallel for if(conf.openmp)
-    #endif
-    for (size_t k = 0; k < sample_size; ++k) {
-        delete[] quant_inds[k];
-    }
-    delete[] quant_inds;
-    delete[] quant_inds_size;
-    delete[] buffer;
-
     return compression_ratio;
 
 }
@@ -167,62 +157,78 @@ template <class T, uint N>
 void interp_compress_test_batch(
     const std::vector<std::vector<T>> &sampled_blocks, const Config *confs, int nconf,
     int block_size, double *ratios_out) {
+    if (nconf <= 0) return;
     // Flatten config x block into one task pool so all threads can process sampled blocks.
     size_t B = sampled_blocks.size();
     size_t total = static_cast<size_t>(nconf) * B;
-    int16_t **quant_inds = new int16_t*[total];
-    uint64_t *quant_inds_size = new uint64_t[total];
+    std::vector<std::unique_ptr<int16_t[]>> quant_inds(total);
+    std::vector<uint64_t> quant_inds_size(total);
     std::vector<std::vector<T>> unpred_vec(total);
 #ifdef _OPENMP
-#pragma omp parallel for schedule(static) if(nconf > 0 && confs[0].openmp)
+#pragma omp parallel if(confs[0].openmp)
 #endif
-    for (size_t t = 0; t < total; ++t) {
-        int c = static_cast<int>(t / B);
-        size_t k = t % B;
-        auto falcons = make_decomposition_interpolation<TUNING::ENABLED, T, N>(
-            confs[c], LinearQuantizer<T>(confs[c].absErrorBound, confs[c].quantbinCnt / 2));
-        auto cur_block = sampled_blocks[k];
-        std::tie(quant_inds[t], quant_inds_size[t]) = falcons.compress(confs[c], cur_block.data());
-        unpred_vec[t] = falcons.test_unpred();
+    {
+        std::vector<T> cur_block;
+#ifdef _OPENMP
+#pragma omp for schedule(static)
+#endif
+        for (size_t t = 0; t < total; ++t) {
+            int c = static_cast<int>(t / B);
+            size_t k = t % B;
+            auto falcons = make_decomposition_interpolation<TUNING::ENABLED, T, N>(
+                confs[c], LinearQuantizer<T>(confs[c].absErrorBound, confs[c].quantbinCnt / 2));
+            cur_block.assign(sampled_blocks[k].begin(), sampled_blocks[k].end());
+            auto [indices, count] = falcons.compress(confs[c], cur_block.data());
+            quant_inds[t].reset(indices);
+            quant_inds_size[t] = count;
+            unpred_vec[t].swap(falcons.test_unpred());
+        }
     }
 
 #ifdef _OPENMP
-#pragma omp parallel for schedule(static) if(nconf > 0 && confs[0].openmp)
+#pragma omp parallel if(confs[0].openmp)
 #endif
-    for (int c = 0; c < nconf; ++c) {
-        size_t base = static_cast<size_t>(c) * B;
-        std::vector<size_t> prefix_sum(B << 1);
-        size_t cur_size = 0;
-        for (size_t k = 0; k < B << 1; ++k) {
-            prefix_sum[k] = cur_size;
-            if (k < B) {
+    {
+        // Region-local capacities are bounded by this worker's largest candidate.
+        std::unique_ptr<uchar[]> buffer, cmpData;
+        size_t buffer_capacity = 0, cmp_capacity = 0;
+#ifdef _OPENMP
+#pragma omp for schedule(static)
+#endif
+        for (int c = 0; c < nconf; ++c) {
+            size_t base = static_cast<size_t>(c) * B;
+            size_t cur_size = 0;
+            for (size_t k = 0; k < B; ++k) {
                 cur_size += unpred_vec[base + k].size() * sizeof(T);
-            } else {
-                cur_size += quant_inds_size[base + k - B] * sizeof(int16_t);
             }
-        }
-        uchar *buffer = new uchar[cur_size];
-        for (size_t k = 0; k < B << 1; ++k) {
-            if (k < B) {
-                if (!unpred_vec[base + k].empty())
-                    memcpy(buffer + prefix_sum[k], reinterpret_cast<const uchar *>(unpred_vec[base + k].data()),
-                           unpred_vec[base + k].size() * sizeof(T));
-            } else {
-                memcpy(buffer + prefix_sum[k], reinterpret_cast<const uchar *>(quant_inds[base + k - B]),
-                       quant_inds_size[base + k - B] * sizeof(int16_t));
+            for (size_t k = 0; k < B; ++k) {
+                cur_size += quant_inds_size[base + k] * sizeof(int16_t);
             }
+            if (!buffer || buffer_capacity < cur_size) {
+                buffer.reset(new uchar[cur_size]);
+                buffer_capacity = cur_size;
+            }
+            size_t offset = 0;
+            for (size_t k = 0; k < B; ++k) {
+                size_t bytes = unpred_vec[base + k].size() * sizeof(T);
+                if (bytes != 0) memcpy(buffer.get() + offset, unpred_vec[base + k].data(), bytes);
+                offset += bytes;
+            }
+            for (size_t k = 0; k < B; ++k) {
+                size_t bytes = quant_inds_size[base + k] * sizeof(int16_t);
+                if (bytes != 0) memcpy(buffer.get() + offset, quant_inds[base + k].get(), bytes);
+                offset += bytes;
+            }
+            size_t cmpCap = sizeof(size_t) + ZSTD_compressBound(cur_size);
+            if (cmp_capacity < cmpCap) {
+                cmpData.reset(new uchar[cmpCap]);
+                cmp_capacity = cmpCap;
+            }
+            auto lossless = Lossless_zstd();
+            auto cmpSize = lossless.compress(buffer.get(), cur_size, cmpData.get(), cmpCap);
+            ratios_out[c] = confs[c].num * B * sizeof(T) * 1.0 / cmpSize;
         }
-        size_t cmpCap = cur_size + (cur_size >> 1) + 1024;
-        uchar *cmpData = new uchar[cmpCap];
-        auto lossless = Lossless_zstd();
-        auto cmpSize = lossless.compress(buffer, cur_size, cmpData, cmpCap);
-        ratios_out[c] = confs[c].num * B * sizeof(T) * 1.0 / cmpSize;
-        delete[] cmpData;
-        delete[] buffer;
     }
-    for (size_t t = 0; t < total; ++t) delete[] quant_inds[t];
-    delete[] quant_inds;
-    delete[] quant_inds_size;
 }
 
 template <class T, uint N>

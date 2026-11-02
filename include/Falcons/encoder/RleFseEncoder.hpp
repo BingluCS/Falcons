@@ -44,6 +44,10 @@
 #include <cstdint>
 #include <cmath>
 #include <algorithm>
+#include <cassert>
+#include <limits>
+#include <memory>
+#include <new>
 
 #ifdef __AVX2__
 #include <immintrin.h>
@@ -134,6 +138,51 @@ class RleFseEncoder : public concepts::EncoderInterface<T> {
         return i - s;
     }
 
+#ifdef __AVX2__
+    static inline size_t rle_scan_run_cached(const T *a, size_t i, size_t n, T mode,
+                                             __m256i vm, size_t &block_end,
+                                             uint32_t &nonmode_mask) {
+        const size_t start = i;
+        // Consume each block's mismatches once, with one mask bit per 16-bit lane.
+        while (!nonmode_mask && n - block_end >= 16) {
+            const __m256i values =
+                _mm256_loadu_si256(reinterpret_cast<const __m256i *>(a + block_end));
+            nonmode_mask = ~static_cast<uint32_t>(
+                _mm256_movemask_epi8(_mm256_cmpeq_epi16(values, vm))) & 0x55555555u;
+            block_end += 16;
+        }
+        if (nonmode_mask) {
+            const size_t next = block_end - 16 + (__builtin_ctz(nonmode_mask) >> 1);
+            nonmode_mask &= nonmode_mask - 1;
+            return next - start;
+        }
+        i = std::max(i, block_end);
+        while (i < n && a[i] == mode) ++i;
+        return i - start;
+    }
+#endif
+
+    static inline void rle_flush_value_mantissa(uint8_t *dst, size_t capacity, size_t &pos,
+                                               uint64_t acc, int &bits) {
+        // At most 17 value bits plus 7 carry bits; only complete bytes advance pos.
+        if (pos <= capacity && capacity - pos >= sizeof(uint32_t)) {
+            const uint32_t word = static_cast<uint32_t>(
+                acc << ((32u - static_cast<unsigned>(bits)) & 31u));
+            const uint8_t packed[4] = {
+                static_cast<uint8_t>(word >> 24), static_cast<uint8_t>(word >> 16),
+                static_cast<uint8_t>(word >> 8), static_cast<uint8_t>(word)
+            };
+            memcpy(dst + pos, packed, sizeof(packed));
+            pos += static_cast<unsigned>(bits) >> 3;
+            bits &= 7;
+            return;
+        }
+        while (bits >= 8) {
+            bits -= 8;
+            dst[pos++] = static_cast<uint8_t>(acc >> bits);
+        }
+    }
+
     // Write L copies of mode (decode mirror of scan_run's SIMD find).
     static inline void fill_mode(T *dst, size_t L, T mode) {
 // #ifdef __AVX2__
@@ -147,9 +196,10 @@ class RleFseEncoder : public concepts::EncoderInterface<T> {
     }
 
     // FSE class bytes in blocks: [u8 flag][u32 clen?][data]; returns bytes written
-    static size_t fse_enc(const uint8_t *src, size_t n, uint8_t *out) {
+    size_t fse_enc(const uint8_t *src, size_t n, uint8_t *out) {
+        if (n == 0) return 0;
         size_t p = 0; 
-        uint8_t *tmp = static_cast<uint8_t*>(malloc(FBLK + 1024));
+        uint8_t *tmp = encode_workspace().fse_tmp.get(FBLK + 1024);
         for (size_t off = 0; off < n; off += FBLK) {
             size_t len = n - off < FBLK ? n - off : FBLK;
             size_t r = FSE_compress(tmp, FBLK + 1024, src + off, len);
@@ -171,7 +221,6 @@ class RleFseEncoder : public concepts::EncoderInterface<T> {
                 p += r; 
             }
         }
-        free(tmp);
         return p;
     }
     static void fse_dec(const uint8_t *in, size_t n_orig, uint8_t *dst) {
@@ -477,18 +526,149 @@ class RleFseEncoder : public concepts::EncoderInterface<T> {
     }
 
     static constexpr int O1T_K = 4;   // tANS: number of interleaved bitstreams for ILP (max 16; arrays sized 16)
-    // ---- K-stream context-switching tANS (method_==4) ----
+
+    template <class V>
+    struct EncodeBuffer {
+        std::unique_ptr<V[]> data;
+        size_t capacity = 0;
+        V *get(size_t n) {
+            if (n > capacity) {
+                data.reset(new V[n]);
+                capacity = n;
+            }
+            return data.get();
+        }
+    };
+
+    static constexpr size_t RLE_ALIGNMENT = 64;
+    struct RleBuffers {
+        uint8_t *rcl, *vcl, *rman, *vman;
+        size_t vman_capacity;
+    };
+    struct RleLayout {
+        size_t vcl, rman, vman, vman_capacity, bytes;
+    };
+    static size_t rle_checked_add(size_t a, size_t b) {
+        if (b > std::numeric_limits<size_t>::max() - a) throw std::bad_array_new_length();
+        return a + b;
+    }
+    static size_t rle_align_up(size_t n) {
+        return rle_checked_add(n, RLE_ALIGNMENT - 1) & ~(RLE_ALIGNMENT - 1);
+    }
+    static size_t rle_vman_capacity(size_t n) {
+        // A loaded uint16 mode can differ from an int16 code by up to 98303.
+        // Reserve ceil(17*n/8) plus write padding without overflowing 17*n.
+        const size_t extra = n / 8 + (n % 8 != 0);
+        return rle_checked_add(rle_checked_add(n, n), rle_checked_add(extra, 16));
+    }
+    static RleLayout rle_layout(size_t n) {
+        const size_t vcl = rle_align_up(rle_checked_add(n, 1));
+        const size_t rman = rle_checked_add(vcl, vcl);
+        const size_t vman = rle_checked_add(rman, rle_align_up(rle_checked_add(n, 16)));
+        const size_t vman_capacity = rle_vman_capacity(n);
+        const size_t end = rle_checked_add(vman, vman_capacity);
+        return {vcl, rman, vman, vman_capacity, rle_checked_add(end, RLE_ALIGNMENT - 1)};
+    }
+#ifdef __AVX2__
+    static constexpr size_t O1T_TILE = 256;
+#endif
+
+    struct EncodeWorkspace {
+        EncodeBuffer<uint8_t> rle_slab;
+        // Overflow scratch must not reallocate the live RLE slab or tANS streams.
+        EncodeBuffer<uint8_t> vcl, vman, ovf_classes, fse_tmp, streams;
+        EncodeBuffer<int16_t> ovf;
+        EncodeBuffer<FSE_CTable> ct;
+        EncodeBuffer<FSE_symbolCompressionTransform> flat_tt;
+#ifdef __AVX2__
+        uint16_t prepared_indices[O1T_K][O1T_TILE];
+#endif
+        uint32_t cnt[O1_NCTX * O1T_NSYM];
+        uint16_t nf[O1_NCTX * O1T_NSYM];
+        uint16_t table_freq[O1_NCTX * O1T_NSYM];
+        bool table_valid[O1_NCTX] = {};
+
+        RleBuffers rle_buffers(size_t n) {
+            const RleLayout layout = rle_layout(n);
+            // Grow the entire slab before deriving any interior pointers.
+            void *storage = rle_slab.get(layout.bytes);
+            size_t space = layout.bytes;
+            auto *base = static_cast<uint8_t *>(
+                std::align(RLE_ALIGNMENT, layout.bytes - (RLE_ALIGNMENT - 1), storage, space));
+            assert(base != nullptr);
+            return {base, base + layout.vcl, base + layout.rman, base + layout.vman,
+                    layout.vman_capacity};
+        }
+    };
+    std::unique_ptr<EncodeWorkspace> workspace_;
+
+#ifdef FALCONS_V11_ENTROPY_TEST
+    friend struct RleFseEncoderV11TestAccess;
+#endif
+
+    EncodeWorkspace &encode_workspace() {
+        if (!workspace_) workspace_.reset(new EncodeWorkspace);
+        return *workspace_;
+    }
+
+    static inline void o1_encode_symbol(BIT_CStream_t &bit, FSE_CState_t &state,
+                                       const U16 *state_base,
+                                       const FSE_symbolCompressionTransform *flat_tt,
+                                       unsigned index) {
+        const FSE_symbolCompressionTransform tt = flat_tt[index];
+        const U32 nb = static_cast<U32>((state.value + tt.deltaNbBits) >> 16);
+        BIT_addBits(&bit, state.value, nb);
+        state.value = state_base[(state.value >> nb) + tt.deltaFindState];
+    }
+
+#ifdef __AVX2__
+    static inline __m256i o1_packed_indices(__m256i previous, __m256i current) {
+        const __m256i zero = _mm256_setzero_si256();
+        const __m256i four = _mm256_set1_epi16(4);
+        // Clamp unsigned first: abs(INT16_MIN) is 0x8000, not a positive signed lane.
+        const __m256i a = _mm256_min_epu16(_mm256_abs_epi16(previous), _mm256_set1_epi16(12));
+        const __m256i beyond = _mm256_add_epi16(_mm256_cmpgt_epi16(a, four),
+            _mm256_add_epi16(_mm256_cmpgt_epi16(a, _mm256_set1_epi16(7)),
+                             _mm256_cmpgt_epi16(a, _mm256_set1_epi16(11))));
+        const __m256i bucket = _mm256_sub_epi16(_mm256_min_epu16(a, four), beyond);
+        __m256i context = _mm256_add_epi16(
+            _mm256_sub_epi16(_mm256_slli_epi16(bucket, 1), _mm256_set1_epi16(1)),
+            _mm256_srli_epi16(previous, 15));
+        context = _mm256_andnot_si256(_mm256_cmpeq_epi16(a, zero), context);
+        const __m256i zigzag = _mm256_xor_si256(_mm256_slli_epi16(current, 1),
+                                              _mm256_srai_epi16(current, 15));
+        const __m256i symbol = _mm256_min_epu16(zigzag, _mm256_set1_epi16(255));
+        return _mm256_or_si256(_mm256_slli_epi16(context, 8), symbol);
+    }
+
+    static inline void o1_prepare_indices(const T *current, size_t count, uint16_t *indices,
+                                          const O1Lut &L) {
+        size_t i = 0;
+        for (; i + 16 <= count; i += 16) {
+            const __m256i previous = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(current + i - 1));
+            const __m256i code = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(current + i));
+            _mm256_storeu_si256(reinterpret_cast<__m256i *>(indices + i), o1_packed_indices(previous, code));
+        }
+        for (; i < count; ++i)
+            indices[i] = O1T_NSYM * L.ctx[static_cast<uint16_t>((current + i)[-1])] +
+                         L.sym256[static_cast<uint16_t>(current[i])];
+    }
+#endif
+
+    // ---- Generic K-stream context-switching tANS (method_==1) ----
     // K independent FSE bitstreams (chunks), each switching (stateTable,symbolTT)/DTable per symbol
     // by the 15-way context. Interleaved -> K independent chains hide the FSE state latency (ILP).
-    static size_t encode_o1_ovf(const int16_t *ovf, size_t n, uchar *&bytes) {
+    size_t encode_o1_ovf(const int16_t *ovf, size_t n, uchar *&bytes) {
         uchar *sb = bytes;
         if (n == 0) {
             write(static_cast<uint8_t>(0), bytes);
             return bytes - sb;
         }
 
-        uint8_t *vcl = static_cast<uint8_t *>(malloc(n));
-        uint8_t *vman = static_cast<uint8_t *>(malloc(2 * n + 16));
+        EncodeWorkspace &ws = encode_workspace();
+        uint8_t *vcl = ws.vcl.get(n);
+        // These are signed int16 escapes relative to zero, needing at most 16 mantissa bits.
+        uint8_t *vman = ws.vman.get(2 * n + 16);
         size_t vbp = 0;
         uint64_t vacc = 0;
         int van = 0;
@@ -508,7 +688,7 @@ class RleFseEncoder : public concepts::EncoderInterface<T> {
         if (van > 0)
             vman[vbp++] = static_cast<uint8_t>(vacc << (8 - van));
 
-        uint8_t *o_vcl = static_cast<uint8_t *>(malloc(n + n / FBLK * 8 + 64));
+        uint8_t *o_vcl = ws.ovf_classes.get(n + n / FBLK * 8 + 64);
         size_t s_vcl = fse_enc(vcl, n, o_vcl);
         const size_t raw_size = n * sizeof(int16_t);
         const size_t cm_size = s_vcl + vbp + 2 * sizeof(uint64_t);
@@ -525,9 +705,6 @@ class RleFseEncoder : public concepts::EncoderInterface<T> {
             memcpy(bytes, vman, vbp);
             bytes += vbp;
         }
-        free(vcl);
-        free(vman);
-        free(o_vcl);
         return bytes - sb;
     }
 
@@ -603,10 +780,12 @@ class RleFseEncoder : public concepts::EncoderInterface<T> {
         //     return (size_t)(bytes - sb); 
         // }
         size_t cs = (N + O1T_K - 1) / O1T_K;
-        int16_t *ovf = static_cast<int16_t *>(malloc(N * 2));
+        EncodeWorkspace &ws = encode_workspace();
+        int16_t *ovf = ws.ovf.get(N);
         size_t novf = 0;
         size_t novf_k[16] = {0};
-        uint32_t *cnt = static_cast<uint32_t *>(calloc(O1_NCTX * O1T_NSYM, 4));
+        uint32_t *cnt = ws.cnt;
+        memset(cnt, 0, sizeof(ws.cnt));
         //std::getenv("FALCONS_TANS_FULLHIST") || 
         if (N < (1u << 20)) {       // exact full per-context histogram (opt-out via env / small N); default = fast sampled path below
             for (int k = 0; k < O1T_K; k++) { 
@@ -658,33 +837,66 @@ class RleFseEncoder : public concepts::EncoderInterface<T> {
                 cnt[t]++;   // Laplace +1: no zero-freq -> any real symbol stays encodable
         }
         
-        uint16_t *nf = static_cast<uint16_t *>(malloc(O1_NCTX * O1T_NSYM * 2));
+        uint16_t *nf = ws.nf;
 
-        const void *stTab[O1_NCTX];
-        const void *syTT[O1_NCTX];
+        const U16 *stTab[O1_NCTX];
+        const FSE_symbolCompressionTransform *syTT[O1_NCTX];
         size_t ctsz = FSE_CTABLE_SIZE_U32(O1T_PB, O1T_NSYM - 1);
         FSE_CTable *ct[O1_NCTX];
-        FSE_CTable *ct_storage = static_cast<FSE_CTable *>(malloc(O1_NCTX * ctsz * sizeof(FSE_CTable)));
+        FSE_CTable *ct_storage = ws.ct.get(O1_NCTX * ctsz);
 
         int16_t normc[O1T_NSYM];
         for (int c = 0; c < O1_NCTX; c++) {
             o1_normalize(cnt + c * O1T_NSYM, nf + c * O1T_NSYM, O1T_NSYM, O1T_M);
-            for (int s = 0; s < O1T_NSYM; s++) 
-                normc[s] = nf[c * O1T_NSYM + s];
             ct[c] = ct_storage + static_cast<size_t>(c) * ctsz;
-            FSE_buildCTable(ct[c], normc, O1T_NSYM - 1, O1T_PB);
+            const uint16_t *freq = nf + c * O1T_NSYM;
+            uint16_t *cached = ws.table_freq + c * O1T_NSYM;
+            if (!ws.table_valid[c] || memcmp(freq, cached, O1T_NSYM * sizeof(*freq)) != 0) {
+                int same = 0;
+                for (; same < c; same++)
+                    if (memcmp(freq, nf + same * O1T_NSYM, O1T_NSYM * sizeof(*freq)) == 0)
+                        break;
+                if (same < c) {
+                    ct[c] = ct[same];
+                } else {
+                    for (int s = 0; s < O1T_NSYM; s++)
+                        normc[s] = static_cast<int16_t>(freq[s]);
+                    FSE_buildCTable(ct[c], normc, O1T_NSYM - 1, O1T_PB);
+                    memcpy(cached, freq, O1T_NSYM * sizeof(*freq));
+                    ws.table_valid[c] = true;
+                }
+            }
             FSE_CState_t tmp; 
             FSE_initCState(&tmp, ct[c]); 
-            stTab[c] = tmp.stateTable; 
-            syTT[c] = tmp.symbolTT;
+            stTab[c] = static_cast<const U16 *>(tmp.stateTable);
+            syTT[c] = static_cast<const FSE_symbolCompressionTransform *>(tmp.symbolTT);
+        }
+        static_assert(sizeof(FSE_CTable) == 2 * sizeof(U16), "Vendored FSE CT word layout changed");
+        static_assert(2 * O1_NCTX * FSE_CTABLE_SIZE_U32(O1T_PB, O1T_NSYM - 1) + O1T_M <=
+                          static_cast<unsigned>(std::numeric_limits<int>::max()),
+                      "Flat CT transform offsets must fit int");
+        const U16 *const encode_st = static_cast<const U16 *>(static_cast<const void *>(ct_storage));
+        FSE_symbolCompressionTransform *const encode_tt = ws.flat_tt.get(O1_NCTX * O1T_NSYM);
+        for (int c = 0; c < O1_NCTX; ++c) {
+            // Rebase within the CT allocation, including FSE's two-U16 header.
+            const int offset = static_cast<int>(2 * (ct[c] - ct_storage) + 2);
+            assert(stTab[c] == encode_st + offset);
+            assert(static_cast<size_t>(offset) + O1T_M <= 2 * O1_NCTX * ctsz);
+            for (int s = 0; s < O1T_NSYM; ++s) {
+                auto &tt = encode_tt[c * O1T_NSYM + s];
+                tt.deltaNbBits = syTT[c][s].deltaNbBits;
+                // Absent symbols leave deltaFindState uninitialized in vendored FSE.
+                tt.deltaFindState = nf[c * O1T_NSYM + s] ? syTT[c][s].deltaFindState + offset : 0;
+            }
         }
         uint8_t *buf[16]; 
         BIT_CStream_t bc[16]; 
         FSE_CState_t cst[16]; 
         size_t initIdx[16]; 
         size_t capk = cs * 2 + 4096;
+        uint8_t *streams = ws.streams.get(O1T_K * capk);
         for (int k = 0; k < O1T_K; k++) {
-            buf[k] = static_cast<uint8_t *>(malloc(capk)); 
+            buf[k] = streams + k * capk;
             BIT_initCStream(&bc[k], buf[k], capk);
             size_t lo = k * cs, hi = lo + cs; 
             if (hi > N) 
@@ -699,7 +911,11 @@ class RleFseEncoder : public concepts::EncoderInterface<T> {
             else 
                 initIdx[k] = -1;
         }
-        for (size_t jj = cs; jj-- > 0; ) {                                 // interleaved reverse; O1T_K independent chains -> ILP
+        // Peel unequal tails and last-symbol initialization before the four-stream interior.
+        size_t jj = cs;
+        const size_t interior = N >= 4 * O1T_K ? N - (O1T_K - 1) * cs - 1 : 0;
+        while (jj > interior) {
+            --jj;
             for (int k = 0; k < O1T_K; k++) { 
                 size_t idx = k * cs + jj; 
                 if (idx >= N || idx == initIdx[k]) 
@@ -708,14 +924,58 @@ class RleFseEncoder : public concepts::EncoderInterface<T> {
                 int prevc = (idx > lo) ? bins[idx - 1] : 0;
                 int c = L.ctx[static_cast<uint16_t>(prevc)]; 
                 int s = L.sym256[static_cast<uint16_t>(bins[idx])];
-                cst[k].stateTable = stTab[c]; 
-                cst[k].symbolTT = syTT[c];
-                FSE_encodeSymbol(&bc[k], &cst[k], static_cast<int16_t>(s)); 
+                o1_encode_symbol(bc[k], cst[k], encode_st, encode_tt, c * O1T_NSYM + s);
             }
             if ((jj & 3) == 0) 
                 for (int k = 0; k < O1T_K; k++) 
                     BIT_flushBits(&bc[k]); 
-        }  // flush every 4 (4*11<57)
+        }
+        if (interior > 0) {
+#ifdef __AVX2__
+            // Prepare forward in bounded tiles; consume backward at the original flush points.
+            while (jj > 1) {
+                const size_t count = std::min(O1T_TILE, jj - 1);
+                const size_t begin = jj - count;
+                for (int k = 0; k < O1T_K; ++k)
+                    o1_prepare_indices(bins + k * cs + begin, count, ws.prepared_indices[k], L);
+                for (size_t t = count; t > 0;) {
+                    --t;
+                    --jj;
+                    o1_encode_symbol(bc[0], cst[0], encode_st, encode_tt, ws.prepared_indices[0][t]);
+                    o1_encode_symbol(bc[1], cst[1], encode_st, encode_tt, ws.prepared_indices[1][t]);
+                    o1_encode_symbol(bc[2], cst[2], encode_st, encode_tt, ws.prepared_indices[2][t]);
+                    o1_encode_symbol(bc[3], cst[3], encode_st, encode_tt, ws.prepared_indices[3][t]);
+                    if ((jj & 3) == 0)
+                        for (int k = 0; k < O1T_K; ++k)
+                            BIT_flushBits(&bc[k]);
+                }
+            }
+            const uint16_t s0 = bins[0], s1 = bins[cs], s2 = bins[2 * cs], s3 = bins[3 * cs];
+#else
+            const T *p0 = bins + jj - 1;
+            const T *p1 = p0 + cs, *p2 = p1 + cs, *p3 = p2 + cs;
+            uint16_t s0 = *p0, s1 = *p1, s2 = *p2, s3 = *p3;
+            while (jj > 1) {
+                --jj;
+                const uint16_t prev0 = p0[-1], prev1 = p1[-1], prev2 = p2[-1], prev3 = p3[-1];
+                o1_encode_symbol(bc[0], cst[0], encode_st, encode_tt, O1T_NSYM * L.ctx[prev0] + L.sym256[s0]);
+                o1_encode_symbol(bc[1], cst[1], encode_st, encode_tt, O1T_NSYM * L.ctx[prev1] + L.sym256[s1]);
+                o1_encode_symbol(bc[2], cst[2], encode_st, encode_tt, O1T_NSYM * L.ctx[prev2] + L.sym256[s2]);
+                o1_encode_symbol(bc[3], cst[3], encode_st, encode_tt, O1T_NSYM * L.ctx[prev3] + L.sym256[s3]);
+                s0 = prev0; s1 = prev1; s2 = prev2; s3 = prev3;
+                --p0; --p1; --p2; --p3;
+                if ((jj & 3) == 0)
+                    for (int k = 0; k < O1T_K; ++k)
+                        BIT_flushBits(&bc[k]);
+            }
+#endif
+            o1_encode_symbol(bc[0], cst[0], encode_st, encode_tt, L.sym256[s0]);
+            o1_encode_symbol(bc[1], cst[1], encode_st, encode_tt, L.sym256[s1]);
+            o1_encode_symbol(bc[2], cst[2], encode_st, encode_tt, L.sym256[s2]);
+            o1_encode_symbol(bc[3], cst[3], encode_st, encode_tt, L.sym256[s3]);
+            for (int k = 0; k < O1T_K; ++k)
+                BIT_flushBits(&bc[k]);
+        }  // Four transitions plus carry fit the existing 64-bit FSE bit container.
         size_t blen[16];
         for (int k = 0; k < O1T_K; k++) { 
             if (initIdx[k] != static_cast<size_t>(-1)) { 
@@ -744,9 +1004,6 @@ class RleFseEncoder : public concepts::EncoderInterface<T> {
         //     std::fprintf(stderr, "[O1tans] N=%zu O1T_K=%d tANS=%zu(%.3f b/sym) novf=%zu(%.1f%%)\n", N, O1T_K, bt, 
         //         bt * 8.0 / N, novf, 100.0 * novf / N); 
         // }
-        for (int k = 0; k < O1T_K; k++) 
-            free(buf[k]);
-        free(ct_storage); free(ovf); free(cnt); free(nf);
         return (bytes - sb);
     }
 
@@ -843,6 +1100,22 @@ class RleFseEncoder : public concepts::EncoderInterface<T> {
     }
 
    public:
+    RleFseEncoder() = default;
+    // Model flags copy, but mutable scratch and cached tables remain object-private.
+    RleFseEncoder(const RleFseEncoder &other)
+        : lo_(other.lo_), mode_(other.mode_), method_(other.method_),
+          use_delta_(other.use_delta_), scan_simd_(other.scan_simd_) {}
+    RleFseEncoder &operator=(const RleFseEncoder &other) {
+        if (this != &other) {
+            lo_ = other.lo_; mode_ = other.mode_; method_ = other.method_;
+            use_delta_ = other.use_delta_; scan_simd_ = other.scan_simd_;
+            workspace_.reset();
+        }
+        return *this;
+    }
+    RleFseEncoder(RleFseEncoder &&) = default;
+    RleFseEncoder &operator=(RleFseEncoder &&) = default;
+
     // void preprocess_encode(const T *bins, size_t num_bin, int stateNum, size_t *frequencyList) {
     //     (void)frequencyList;               // no histogram needed (mode = radius, known a priori)
     //     derive(bins, num_bin, stateNum);
@@ -927,25 +1200,39 @@ class RleFseEncoder : public concepts::EncoderInterface<T> {
         // method_ == 0 -> RLE+FSE+zstd (fallthrough)
         const T mode = static_cast<T>(mode_);
         const int32_t modev = static_cast<int32_t>(mode_);
-        // scratch — raw malloc (NOT zero-initialized): we only touch the bytes we
-        // actually write, so no 5N memset cost on the hot path.
-        uint8_t *rcl = static_cast<uint8_t*>(malloc(N + 1)), *vcl = static_cast<uint8_t*>(malloc(N + 1));
-        uint8_t *rman = static_cast<uint8_t*>(malloc(N + 16)), *vman = static_cast<uint8_t*>(malloc(2 * N + 16));
+        EncodeWorkspace &ws = encode_workspace();
+        const RleBuffers scratch = ws.rle_buffers(N);
+        uint8_t *rcl = scratch.rcl, *vcl = scratch.vcl;
+        uint8_t *rman = scratch.rman, *vman = scratch.vman;
         size_t nr = 0, nv = 0, rbp = 0, vbp = 0; 
         uint64_t racc = 0, vacc = 0; 
         int ran = 0, van = 0;
+        const size_t vman_capacity = scratch.vman_capacity;
+#ifdef __AVX2__
+        const __m256i mode_vector = _mm256_set1_epi16(static_cast<int16_t>(mode));
+        size_t block_end = 0;
+        uint32_t nonmode_mask = 0;
+#endif
         size_t i = 0;
         while (i < N) {
-            size_t L = scan_run(bins, i, N, mode, scan_simd_);
+            size_t L;
+#ifdef __AVX2__
+            if (scan_simd_)
+                L = rle_scan_run_cached(bins, i, N, mode, mode_vector, block_end, nonmode_mask);
+            else
+#endif
+                L = scan_run(bins, i, N, mode, scan_simd_);
             i += L;
             uint64_t v = L + 1; 
             int k = 63 - __builtin_clzll(v); 
             rcl[nr++] = k;
-            racc = (racc << k) | (v & ((1ull << k) - 1)); 
-            ran += k;
-            while (ran >= 8) { 
-                ran -= 8; 
-                rman[rbp++] = (racc >> ran); 
+            if (k) {
+                racc = (racc << k) | (v & ((1ull << k) - 1));
+                ran += k;
+                while (ran >= 8) {
+                    ran -= 8;
+                    rman[rbp++] = (racc >> ran);
+                }
             }
 
             if (i >= N) break;
@@ -957,27 +1244,21 @@ class RleFseEncoder : public concepts::EncoderInterface<T> {
             vcl[nv++] = vk;
             vacc = (vacc << vk) | (vv & ((1ull << vk) - 1)); 
             van += vk;
-            while (van >= 8) {
-                van -= 8; 
-                vman[vbp++] = vacc >> van; 
-            }
+            rle_flush_value_mantissa(vman, vman_capacity, vbp, vacc, van);
         }
         if (ran > 0) rman[rbp++] = (racc << (8 - ran));
         if (van > 0) vman[vbp++] = (vacc << (8 - van));
 
-        uint8_t *o_rcl = static_cast<uint8_t*>(malloc(nr + nr / FBLK * 8 + 64));
-        uint8_t *o_vcl = static_cast<uint8_t*>(malloc(nv + nv / FBLK * 8 + 64));
-
-        size_t s_rcl = fse_enc(rcl, nr, o_rcl), s_vcl = fse_enc(vcl, nv, o_vcl);
         uchar *start = bytes;
-        write(static_cast<uint64_t>(nr), bytes); write(static_cast<uint64_t>(nv), bytes);
-        write(static_cast<uint64_t>(s_rcl), bytes); write(static_cast<uint64_t>(s_vcl), bytes);
-        write(static_cast<uint64_t>(rbp), bytes);  write(static_cast<uint64_t>(vbp), bytes);
-        memcpy(bytes, o_rcl, s_rcl); bytes += s_rcl;
-        memcpy(bytes, o_vcl, s_vcl); bytes += s_vcl;
+        bytes += 6 * sizeof(uint64_t);
+        size_t s_rcl = fse_enc(rcl, nr, bytes); bytes += s_rcl;
+        size_t s_vcl = fse_enc(vcl, nv, bytes); bytes += s_vcl;
         memcpy(bytes, rman, rbp);    bytes += rbp;
         memcpy(bytes, vman, vbp);    bytes += vbp;
-        free(rcl); free(vcl); free(rman); free(vman); free(o_rcl); free(o_vcl);
+        uchar *header = start;
+        write(static_cast<uint64_t>(nr), header); write(static_cast<uint64_t>(nv), header);
+        write(static_cast<uint64_t>(s_rcl), header); write(static_cast<uint64_t>(s_vcl), header);
+        write(static_cast<uint64_t>(rbp), header);  write(static_cast<uint64_t>(vbp), header);
         return static_cast<size_t>(bytes - start);
     }
 
@@ -1085,7 +1366,10 @@ class RleFseEncoder : public concepts::EncoderInterface<T> {
         return encode(bins.data(), bins.size(), bytes);
     }
     void preprocess_decode() override {}
-    void postprocess_encode() override {}
+    void postprocess_encode() override {
+        // Release per-call scratch before final Zstd; keep the serialized model flags.
+        workspace_.reset();
+    }
     void postprocess_decode() override {}
     size_t size_est() override { return 64; }
     // Fixed per-call overhead the encoder can emit regardless of input size: FSE normalized-count

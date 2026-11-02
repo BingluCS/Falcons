@@ -2,11 +2,7 @@
  * @file Config.hpp
  * @brief This file defines the configuration class and related utilities for Falcons.
  *
- * @note Do not delete any existing fields for backward compatibility.
- *       These fields are critical for ensuring that serialized configurations
- *       from older versions of Falcons remain compatible with newer versions.
- *       Removing or altering fields could break deserialization or cause
- *       unexpected behavior in applications relying on Falcons.
+ * @note Serialized configurations belong to the current data version.
  */
 
 #ifndef Falcons_Config_HPP

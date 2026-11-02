@@ -1,5 +1,9 @@
 # Falcons: Pushing the Speed-Ratio Limits of Lossy Compression for Parallel Scientific Applications
 
+Falcons 1.1 writes data version 1.1.0 and does not check the recorded data
+version when decoding. Streams from earlier versions are not supported;
+decoding them may fail or produce incorrect results.
+
 ## Build & install
 
 ```bash

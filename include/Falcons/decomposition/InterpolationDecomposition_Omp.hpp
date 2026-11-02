@@ -14,8 +14,12 @@
 #include <sys/mman.h>
 #endif
 #include <omp.h>
+#include <cfenv>
 #include <cmath>
+#include <cstdint>
 #include <cstring>
+#include <limits>
+#include <stdexcept>
 #include <type_traits>
 #include "Decomposition.hpp"
 #include "Falcons/def.hpp"
@@ -24,6 +28,7 @@
 #include "Falcons/utils/Config.hpp"
 #include "Falcons/utils/FileUtil.hpp"
 #include "Falcons/utils/Interpolators.hpp"
+#include "Falcons/utils/InterpolationPacking.hpp"
 #include "Falcons/utils/Iterator.hpp"
 #include "Falcons/utils/MemoryUtil.hpp"
 #include "Falcons/utils/Timer.hpp"
@@ -31,6 +36,8 @@
 
 #ifdef __AVX2__
 #include <immintrin.h>
+#elif defined(__SSE__)
+#include <xmmintrin.h>
 #endif
 
 #ifdef __ARM_FEATURE_SVE2
@@ -48,6 +55,10 @@ class InterpolationDecomposition_OMP : public concepts::DecompositionInterface_O
     }
 
     T *decompress(const Config &conf, int16_t** local_quant_inds_vec, T *dec_data) override {
+        if (!dec_data || conf.dims.size() != N ||
+            !std::equal(original_dimensions.begin(), original_dimensions.end(), conf.dims.begin())) {
+            throw std::invalid_argument("Interpolation dimensions do not match the output buffer");
+        }
 #ifdef Falcons_PRINT_TIMINGS
         Timer timer(true);
 #endif
@@ -97,11 +108,17 @@ class InterpolationDecomposition_OMP : public concepts::DecompositionInterface_O
         // quantizer.init_local_unpred(nThreads, each_num);
         CacheLineInt* local_quant_index_vec = new CacheLineInt[nThreads];
         // auto each_num = (num_elements / nThreads) << 1;
-        #pragma omp parallel for
+        const bool observe_coarse_workers = coarse_dispatch_candidate();
+        int coarse_workers_ok = 1;
+        #pragma omp parallel for reduction(&:coarse_workers_ok)
         for (size_t i = 0; i < nThreads; ++i) {
+            if (observe_coarse_workers) {
+                coarse_workers_ok &= omp_get_num_threads() == nThreads && coarse_fp_environment_ok();
+            }
             // local_quant_inds_vec[i] = new int[each_num];
             local_quant_index_vec[i].value = 0;
         }
+        coarse_serial_ready = observe_coarse_workers && coarse_workers_ok;
         local_quant_inds = local_quant_inds_vec;
         local_quant_index = local_quant_index_vec;
         quantizer.reset_local_unpred_idx(nThreads);  // rewind per-thread outlier read cursors (shared with compress)
@@ -185,6 +202,9 @@ class InterpolationDecomposition_OMP : public concepts::DecompositionInterface_O
 
     // compress given the error bound
     std::tuple<int16_t**, CacheLineInt*> compress(const Config &conf, T *data) override {
+        if (!data || conf.dims.size() != N) {
+            throw std::invalid_argument("Invalid interpolation input dimensions or buffer");
+        }
 #ifdef Falcons_PRINT_TIMINGS
         Timer timer(true);
 #endif
@@ -236,7 +256,28 @@ class InterpolationDecomposition_OMP : public concepts::DecompositionInterface_O
         int16_t** local_quant_inds_vec = new int16_t*[nThreads];
         CacheLineInt* local_quant_index_vec = new CacheLineInt[nThreads];
 
-        int each_num = (num_elements / nThreads) << (nThreads == 1 ? 0 : 2);
+        if constexpr (std::is_integral_v<T> || N == 4) {
+            local_stream_capacity = scalar_stream_capacity();
+        } else if constexpr (N == 3) {
+            local_stream_capacity = (direction_sequence_id == 0 || direction_sequence_id == 5)
+                ? std::max((num_elements / nThreads) * (nThreads == 1 ? 1 : 4),
+                           simd_stream_capacity())
+                : scalar_stream_capacity();
+        } else if constexpr (N == 2) {
+            local_stream_capacity = std::max((num_elements / nThreads) * (nThreads == 1 ? 1 : 4),
+                                             simd_stream_capacity());
+        } else {
+#if !defined(__AVX2__) && !defined(__ARM_FEATURE_SVE2)
+            // The scalar 1D kernel emits its entire stream on the calling thread.
+            local_stream_capacity = num_elements;
+#else
+            local_stream_capacity = (num_elements / nThreads) * (nThreads == 1 ? 1 : 4);
+#endif
+        }
+        if (local_stream_capacity > static_cast<size_t>(std::numeric_limits<int>::max())) {
+            throw std::length_error("OMP per-thread stream exceeds cursor range");
+        }
+        const int each_num = static_cast<int>(local_stream_capacity);
         quantizer.init_local_unpred(nThreads, each_num);
 
         constexpr size_t alignment = 64;          // cache line alignment
@@ -263,11 +304,17 @@ class InterpolationDecomposition_OMP : public concepts::DecompositionInterface_O
         }
 #endif
 
-        #pragma omp parallel for
+        const bool observe_coarse_workers = coarse_dispatch_candidate();
+        int coarse_workers_ok = 1;
+        #pragma omp parallel for reduction(&:coarse_workers_ok)
         for (size_t i = 0; i < nThreads; ++i) {
+            if (observe_coarse_workers) {
+                coarse_workers_ok &= omp_get_num_threads() == nThreads && coarse_fp_environment_ok();
+            }
             local_quant_inds_vec[i] = total_quant_inds + i * padded_each_num;
             local_quant_index_vec[i].value = 0;
         }
+        coarse_serial_ready = observe_coarse_workers && coarse_workers_ok;
 
         // #pragma omp parallel for
         // for (size_t i = 0; i < nThreads; ++i) {
@@ -434,6 +481,182 @@ class InterpolationDecomposition_OMP : public concepts::DecompositionInterface_O
     std::pair<int, int> get_out_range() override { return quantizer.get_out_range(); }
 
    private:
+    bool coarse_serial_ready = false;
+
+    size_t scalar_stream_capacity() const {
+        const auto share = [&](size_t rows) {
+            return rows / nThreads + (rows % nThreads != 0);
+        };
+        size_t capacity = 1;  // The root belongs to thread 0.
+        int start_level = interp_level;
+        if (anchor_stride != 0) {
+            capacity = share(1 + (original_dimensions[0] - 1) / anchor_stride);
+            for (uint i = 1; i < N; ++i) {
+                capacity *= 1 + (original_dimensions[i] - 1) / anchor_stride;
+            }
+            --start_level;
+        }
+        const auto &dims = dim_sequences[direction_sequence_id];
+        for (int level = start_level; level > 0; --level) {
+            const size_t stride = size_t(1) << (level - 1);
+            std::array<size_t, N> counts;
+            for (uint i = 0; i < N; ++i) {
+                counts[i] = 1 + (original_dimensions[i] - 1) / (2 * stride);
+            }
+            for (const int axis : dims) {
+                const size_t n = 1 + (original_dimensions[axis] - 1) / stride;
+                if (n > 1) {
+                    size_t interior, boundaries;
+                    if (interp_id == 0 || (N <= 2 && n < 5)) {
+                        interior = (n - 1) / 2;
+                        boundaries = (n % 2 == 0);
+                    } else {
+                        interior = n > 6 ? (n - 5) / 2 : 0;
+                        boundaries = 1 + (n % 2 == 1 ? n > 3 : n > 4) +
+                                     (n % 2 == 0 && n > 2);
+                    }
+                    if constexpr (N <= 2) {
+                        size_t lines = 1;
+                        for (uint i = 0; i < N; ++i) {
+                            if (i != static_cast<uint>(axis)) lines *= counts[i];
+                        }
+                        capacity += (share(interior) + boundaries) * lines;
+                    } else {
+                        size_t plane = 1;
+                        for (uint i = 1; i < N; ++i) {
+                            if (i != static_cast<uint>(axis)) plane *= counts[i];
+                        }
+                        // foreach_omp2 partitions axis 0. Its boundary sweeps on
+                        // that axis assign whole planes to thread 0, not 1/P each.
+                        capacity += axis == 0
+                            ? (share(interior) + boundaries) * plane
+                            : share(counts[0]) * (n / 2) * plane;
+                    }
+                }
+                counts[axis] = n;
+            }
+        }
+        // Each sample needs at most one code or anchor and one outlier slot.
+        return capacity;
+    }
+
+    size_t simd_stream_capacity() const {
+        // The interpolation schedules assume a fixed, full team. A reduced or
+        // nested team can concentrate all samples in a single stream.
+        if (omp_get_dynamic() || omp_get_level() != 0 ||
+            static_cast<size_t>(omp_get_thread_limit()) < nThreads) {
+            return num_elements;
+        }
+        const auto share = [&](size_t rows) {
+            return rows / nThreads + (rows % nThreads != 0);
+        };
+        size_t capacity = 1;
+        int start_level = interp_level;
+        if (anchor_stride != 0) {
+            capacity = share(1 + (original_dimensions[0] - 1) / anchor_stride);
+            for (uint i = 1; i < N; ++i) {
+                capacity *= 1 + (original_dimensions[i] - 1) / anchor_stride;
+            }
+            --start_level;
+        }
+        const auto &dims = dim_sequences[direction_sequence_id];
+        for (int level = start_level; level > 0; --level) {
+            const size_t stride = size_t(1) << (level - 1);
+            std::array<size_t, N> counts;
+            for (uint i = 0; i < N; ++i) {
+                counts[i] = 1 + (original_dimensions[i] - 1) / (2 * stride);
+            }
+            for (const int axis : dims) {
+                const size_t n = 1 + (original_dimensions[axis] - 1) / stride;
+                if (n > 1) {
+                    if constexpr (N == 2) {
+                        if (axis == 0) {
+                            // The interior rows are partitioned, but boundary rows
+                            // are processed in full by thread 0.
+                            const size_t interior = interp_id == 0 ? (n - 1) / 2
+                                                                   : (n > 6 ? (n - 5) / 2 : 0);
+                            const size_t boundaries = interp_id == 0 ? (n % 2 == 0)
+                                : 1 + (n % 2 == 1 ? n > 3 : n > 4) + (n % 2 == 0 && n > 2);
+                            capacity += (share(interior) + boundaries) * counts[1];
+                        } else {
+                            capacity += share(counts[0]) * (n / 2);
+                        }
+                    } else if constexpr (N == 3) {
+                        if (axis == 0) {
+                            capacity += share(counts[1]) * (n / 2) * counts[2];
+                        } else if (axis == 1) {
+                            capacity += share(counts[0]) * (n / 2) * counts[2];
+                        } else {
+                            capacity += share(counts[0] * counts[1]) * (n / 2);
+                        }
+                    }
+                }
+                counts[axis] = n;
+            }
+        }
+        return capacity;
+    }
+
+    static bool coarse_dispatch_candidate() {
+#if defined(Falcons_OMP_COARSE_TEST_FULL_TEAMS)
+        return false;
+#elif defined(Falcons_OMP_COARSE_TEST_FORCE_ENABLE) || \
+    (defined(__GNUC__) && !defined(__clang__) && !defined(__INTEL_COMPILER) && !defined(__INTEL_LLVM_COMPILER))
+        return N == 3 && (std::is_same_v<T, float> || std::is_same_v<T, double>) &&
+               omp_get_level() == 0 && !omp_get_dynamic();
+#else
+        // The serial partition must match the compiler/runtime's static schedule.
+        return false;
+#endif
+    }
+
+    static bool coarse_fp_environment_ok() {
+        if (std::fegetround() != FE_TONEAREST) return false;
+#if defined(__AVX2__) || defined(__SSE__)
+        // Check every executing worker, not just the caller: pooled workers retain MXCSR.
+        return (_mm_getcsr() & 0xffc0u) == 0x1f80u;
+#elif defined(__aarch64__)
+        std::uint64_t fpcr;
+        __asm__ volatile("mrs %0, fpcr" : "=r"(fpcr));
+        return fpcr == 0;
+#else
+        return true;
+#endif
+    }
+
+    static size_t coarse_trip_count(size_t begin, size_t end, size_t step) {
+        return begin < end && step != 0 ? 1 + (end - 1 - begin) / step : 0;
+    }
+
+    bool coarse_region_is_small(size_t items, size_t values, size_t planes = 1) const {
+        if (!coarse_serial_ready || nThreads == 0) return false;
+#ifdef Falcons_OMP_COARSE_TEST_MAX_VALUES
+        static_assert(Falcons_OMP_COARSE_TEST_MAX_VALUES >= 0, "coarse ceiling must be nonnegative");
+        constexpr size_t ceiling = Falcons_OMP_COARSE_TEST_MAX_VALUES;
+#else
+        constexpr size_t ceiling = 8192;
+#endif
+        if (ceiling == 0) return false;
+        const size_t limit = nThreads > ceiling / 256 ? ceiling : nThreads * 256;
+        if (items == 0 || values == 0 || planes == 0) return true;
+        // Divide before multiplying, including for collapsed iteration counts.
+        return items <= limit / values && items * values <= limit / planes;
+    }
+
+    template <class Func>
+    void coarse_for_logical_threads(size_t items, Func &&func) {
+        // Stream ownership stays logical; do not merge these ranges into thread 0.
+        const size_t base = items / nThreads;
+        const size_t rem = items % nThreads;
+        for (size_t tid = 0; tid < nThreads; ++tid) {
+            const size_t first = tid * base + std::min(tid, rem);
+            const size_t count = base + (tid < rem);
+            for (size_t i = first; i < first + count; ++i) {
+                func(i, static_cast<int>(tid));
+            }
+        }
+    }
+
     template <COMPMODE CompMode, bool SkipOverwrite>
     ALWAYS_INLINE void quantize_point(size_t idx, T &d, T pred, int tid) {
         (void)idx;
@@ -543,13 +766,36 @@ class InterpolationDecomposition_OMP : public concepts::DecompositionInterface_O
                    [&](T *d) { auto idx = d - data; quantizer.save_unpred( *d, idx);});
     }
 
+    template <class Func>
+    void foreach_stream_static(T *data, size_t offset, const std::array<size_t, N> &begins,
+                               const std::array<size_t, N> &ends, const std::array<size_t, N> &strides,
+                               const std::array<size_t, N> &dim_offsets, Func &&func) {
+        if constexpr (N == 2 || N == 3) {
+            #pragma omp parallel for schedule(static)
+            for (size_t i = begins[0]; i < ends[0]; i += strides[0]) {
+                const int tid = omp_get_thread_num();
+                for (size_t j = begins[1]; j < ends[1]; j += strides[1]) {
+                    const size_t row = offset + i * dim_offsets[0] + j * dim_offsets[1];
+                    if constexpr (N == 2) {
+                        func(data + row, tid);
+                    } else {
+                        for (size_t k = begins[2]; k < ends[2]; k += strides[2]) {
+                            func(data + row + k * dim_offsets[2], tid);
+                        }
+                    }
+                }
+            }
+        } else {
+            foreach_omp2<T, N>(data, offset, begins, ends, strides, dim_offsets, func);
+        }
+    }
+
     void build_anchor_grid2(T *data) {  // store anchor points. steplength: anchor_stride on each dimension
         std::array<size_t, N> strides;
         std::array<size_t, N> begins{0};
         std::fill(strides.begin(), strides.end(), anchor_stride);
-        foreach_omp2
-            <T, N>(data, 0, begins, original_dimensions, strides, original_dim_offsets,
-                   [&](T *d, int tid) {quantizer.save_unpred2(*d, tid);}); //local_quant_inds[0][local_quant_index[0].value++] =
+        foreach_stream_static(data, 0, begins, original_dimensions, strides, original_dim_offsets,
+                              [&](T *d, int tid) {quantizer.save_unpred2(*d, tid);});
     }
 
     void recover_anchor_grid(T *data) {  // recover anchor points. steplength: anchor_stride on each dimension
@@ -568,8 +814,7 @@ class InterpolationDecomposition_OMP : public concepts::DecompositionInterface_O
         std::array<size_t, N> strides;
         std::array<size_t, N> begins{0};
         std::fill(strides.begin(), strides.end(), anchor_stride);
-        foreach_omp2
-            <T, N>(data, 0, begins, original_dimensions, strides, original_dim_offsets, [&](T *d, int tid) {
+        foreach_stream_static(data, 0, begins, original_dimensions, strides, original_dim_offsets, [&](T *d, int tid) {
                 *d = quantizer.recover_unpred2(tid); //d - data
                 // local_quant_index[0].value++;
                 //quant_index++;
@@ -617,16 +862,15 @@ class InterpolationDecomposition_OMP : public concepts::DecompositionInterface_O
             }
             // }
         } else {
-            T *d;
             size_t i;
             #pragma omp parallel for
             for (i = 3; i < n - 3; i += 2) {
                 auto tid = omp_get_thread_num();
-                d = data + begin + i * stride;
+                T *d = data + begin + i * stride;
                 quantize_func(d - data, *d,
                               interp_cubic(*(d - stride3x), *(d - stride), *(d + stride), *(d + stride3x)), tid);
             }
-            d = data + begin + stride;
+            T *d = data + begin + stride;
             quantize_func(d - data, *d, interp_quad_1(*(d - stride), *(d + stride), *(d + stride3x)), 0);
             i = n % 2 == 0 ? n - 3 : n - 2;
             d = data + begin + i * stride;
@@ -1685,10 +1929,10 @@ class InterpolationDecomposition_OMP : public concepts::DecompositionInterface_O
     ALWAYS_INLINE void quantize_1D_double (__m256d& sum, __m256d& ori_avx, __m256d& quant_avx, T tmp[4]);
 
     template <COMPMODE CompMode, int step, bool FullOnly = false, bool SkipOverwrite = false, typename U = T, typename = std::enable_if_t<std::is_same_v<U, float>>>
-    ALWAYS_INLINE void quantize_float (__m256& sum, size_t& start, T*& data, size_t& offset, size_t& len, int tid);
+    ALWAYS_INLINE void quantize_float (__m256& sum, size_t& start, T*& data, size_t& offset, size_t& len, int tid, const __m256* zero_bound = nullptr);
 
     template <COMPMODE CompMode, int step, bool FullOnly = false, bool SkipOverwrite = false, typename U = T, typename = std::enable_if_t<std::is_same_v<U, double>>>
-    ALWAYS_INLINE void quantize_double (__m256d& sum, size_t& start, T*& data, size_t& offset, size_t& len, int tid);
+    ALWAYS_INLINE void quantize_double (__m256d& sum, size_t& start, T*& data, size_t& offset, size_t& len, int tid, const __m256d* zero_bound = nullptr);
 #endif
 #ifdef __ARM_FEATURE_SVE2
     template<typename U = T, typename = std::enable_if_t<std::is_same_v<U, float>>>
@@ -2344,7 +2588,7 @@ template <COMPMODE CompMode, bool SkipOverwrite, class QuantizeFunc>
             ends[direction] = n;
             strides[direction] = 2;
             // size_t odd_len = n/2;//, even_len = n - odd_len;
-            #pragma omp parallel for
+            #pragma omp parallel for schedule(static)
             for (size_t i = begins[0]; i < ends[0]; i += strides[0]) {
                 auto tid = omp_get_thread_num();
                 auto cur_ij_offset = offset + i * dim_offsets[0];
@@ -2359,7 +2603,7 @@ template <COMPMODE CompMode, bool SkipOverwrite, class QuantizeFunc>
             ends[direction] = n;
             strides[direction] = 2;
             // size_t odd_len = n/2;//, even_len = n - odd_len;
-            #pragma omp parallel for
+            #pragma omp parallel for schedule(static)
             for (size_t i = begins[0]; i < ends[0]; i += strides[0]) {
                 auto tid = omp_get_thread_num();
                 auto cur_ij_offset = offset + i * dim_offsets[0];
@@ -2419,9 +2663,8 @@ template <COMPMODE CompMode, bool SkipOverwrite, class QuantizeFunc>
             ends[direction] = (n >= 1) ? (n - 1) : 0;
             strides[direction] = 2;
             size_t vector_len = ends[2] > begins[2] ? (ends[2]-begins[2]-1)/strides[2] + 1 : 0;
-            #pragma omp parallel for
-            for (size_t j = begins[1]; j < ends[1]; j += strides[1]) {
-                auto tid = omp_get_thread_num();
+            const size_t rows = coarse_trip_count(begins[1], ends[1], strides[1]);
+            auto process_row = [&](size_t j, int tid) {
                 auto buffer_offset = buffer_len * tid;
                 auto cur_buffer_1 = interp_buffer_1 + buffer_offset;
                 auto cur_buffer_2 = interp_buffer_2 + buffer_offset;
@@ -2448,7 +2691,12 @@ template <COMPMODE CompMode, bool SkipOverwrite, class QuantizeFunc>
                         cur_buffer_2 = temp_buffer;
 
                         buffer_idx = 0;
-                        for (size_t k = begins[2]; k < ends[2]; k += strides[2]) {
+                        if (packing_detail::use_yz<T>(strides[2], vector_len)) {
+                            // i+1 is an even grid plane; every worker writes odd
+                            // planes only, so the skipped k lanes are read-only too.
+                            packing_detail::copy_stride2(cur_buffer_2,
+                                data + cur_ij_offset + stride + begins[2], vector_len);
+                        } else for (size_t k = begins[2]; k < ends[2]; k += strides[2]) {
                             auto cur_offset =  cur_ij_offset + stride + k;
                         // if (visited[cur_offset]==0 )
                             //   std::cout<<"e2 "<<i<<" "<<j<<" "<<k<<" "<<cur_offset<<std::endl;
@@ -2488,6 +2736,16 @@ template <COMPMODE CompMode, bool SkipOverwrite, class QuantizeFunc>
                         data + cur_ij_offset, strides[2], cur_ij_offset, tid, quantize_func);
                     }
                 }
+            };
+            if (coarse_region_is_small(rows, vector_len, n / 2)) {
+                coarse_for_logical_threads(rows, [&](size_t row, int tid) {
+                    process_row(begins[1] + row * strides[1], tid);
+                });
+            } else {
+                #pragma omp parallel for schedule(static)
+                for (size_t j = begins[1]; j < ends[1]; j += strides[1]) {
+                    process_row(j, omp_get_thread_num());
+                }
             }
             // if (n % 2 == 0) {
             //     begins[direction] = n - 1;
@@ -2508,9 +2766,8 @@ template <COMPMODE CompMode, bool SkipOverwrite, class QuantizeFunc>
             strides[direction] = 2;
             size_t vector_len = ends[2] > begins[2] ? (ends[2]-begins[2]-1)/strides[2] + 1 : 0;
 
-            #pragma omp parallel for
-            for (size_t j = begins[1]; j < ends[1]; j += strides[1]) {
-                auto tid = omp_get_thread_num();
+            const size_t rows = coarse_trip_count(begins[1], ends[1], strides[1]);
+            auto process_row = [&](size_t j, int tid) {
                 auto buffer_offset = buffer_len * tid;
                 auto cur_buffer_1 = interp_buffer_1 + buffer_offset;
                 auto cur_buffer_2 = interp_buffer_2 + buffer_offset;
@@ -2589,7 +2846,11 @@ template <COMPMODE CompMode, bool SkipOverwrite, class QuantizeFunc>
                         cur_buffer_4 = temp_buffer;
 
                         buffer_idx = 0;
-                        for (size_t k = begins[2]; k < ends[2]; k += strides[2]) {
+                        if (packing_detail::use_yz<T>(strides[2], vector_len)) {
+                            // i+3 is an even grid plane, untouched by this sweep.
+                            packing_detail::copy_stride2(cur_buffer_4,
+                                data + cur_ij_offset + stride3x + begins[2], vector_len);
+                        } else for (size_t k = begins[2]; k < ends[2]; k += strides[2]) {
                             auto cur_offset =  cur_ij_offset + stride3x + k;
                            // if (visited[cur_offset]==0 )
                             //   std::cout<<"e2 "<<i<<" "<<j<<" "<<k<<" "<<cur_offset<<std::endl;
@@ -2641,13 +2902,21 @@ template <COMPMODE CompMode, bool SkipOverwrite, class QuantizeFunc>
                 //             data + cur_ij_offset, strides[2], cur_ij_offset, tid);
                 //     // }
                 }
+            };
+            if (coarse_region_is_small(rows, vector_len, n / 2)) {
+                coarse_for_logical_threads(rows, [&](size_t row, int tid) {
+                    process_row(begins[1] + row * strides[1], tid);
+                });
+            } else {
+                #pragma omp parallel for schedule(static)
+                for (size_t j = begins[1]; j < ends[1]; j += strides[1]) {
+                    process_row(j, omp_get_thread_num());
+                }
             }
             if (n % 2 == 0 && n > 2) {
                 /* final plane n-1: scalar edge predictors read data directly (no buffer state) */
                 size_t bnd = n - 1;
-                #pragma omp parallel for
-                for (size_t j = begins[1]; j < ends[1]; j += strides[1]) {
-                    int tid = omp_get_thread_num();
+                auto process_boundary = [&](size_t j, int tid) {
                     auto row = offset + bnd * dim_offsets[0] + j * dim_offsets[1];
                     for (size_t k = begins[2]; k < ends[2]; k += strides[2]) {
                         T *d = data + row + k;
@@ -2669,6 +2938,16 @@ template <COMPMODE CompMode, bool SkipOverwrite, class QuantizeFunc>
                             else
                                 quantize_point<CompMode, SkipOverwrite>(d - data, *d, *(d - stride), tid);
                         }
+                    }
+                };
+                if (coarse_region_is_small(rows, vector_len)) {
+                    coarse_for_logical_threads(rows, [&](size_t row, int tid) {
+                        process_boundary(begins[1] + row * strides[1], tid);
+                    });
+                } else {
+                    #pragma omp parallel for schedule(static)
+                    for (size_t j = begins[1]; j < ends[1]; j += strides[1]) {
+                        process_boundary(j, omp_get_thread_num());
                     }
                 }
             }
@@ -2729,9 +3008,8 @@ template <COMPMODE CompMode, bool SkipOverwrite, class QuantizeFunc>
             strides[direction] = 2;
             size_t vector_len = ends[2] > begins[2] ? (ends[2]-begins[2]-1)/strides[2] + 1 : 0;
 
-            #pragma omp parallel for
-            for (size_t i = begins[0]; i < ends[0]; i += strides[0]) {
-                int tid = omp_get_thread_num();
+            const size_t rows = coarse_trip_count(begins[0], ends[0], strides[0]);
+            auto process_row = [&](size_t i, int tid) {
                 auto buffer_offset = buffer_len * tid;
                 auto cur_buffer_1 = interp_buffer_1 + buffer_offset;
                 auto cur_buffer_2 = interp_buffer_2 + buffer_offset;
@@ -2758,7 +3036,12 @@ template <COMPMODE CompMode, bool SkipOverwrite, class QuantizeFunc>
                         cur_buffer_2 = temp_buffer;
 
                         buffer_idx = 0;
-                        for (size_t k = begins[2]; k < ends[2]; k += strides[2]) {
+                        if (packing_detail::use_yz<T>(strides[2], vector_len)) {
+                            // j+1 is an even grid row; no worker writes any k lane
+                            // in that row while this odd-row sweep is running.
+                            packing_detail::copy_stride2(cur_buffer_2,
+                                data + cur_ij_offset + stride + begins[2], vector_len);
+                        } else for (size_t k = begins[2]; k < ends[2]; k += strides[2]) {
                             auto cur_offset =  cur_ij_offset + stride + k;
                            // if (visited[cur_offset]==0 )
                             //   std::cout<<"e2 "<<i<<" "<<j<<" "<<k<<" "<<cur_offset<<std::endl;
@@ -2806,6 +3089,16 @@ template <COMPMODE CompMode, bool SkipOverwrite, class QuantizeFunc>
                     }
                 }
 
+            };
+            if (coarse_region_is_small(rows, vector_len, n / 2)) {
+                coarse_for_logical_threads(rows, [&](size_t row, int tid) {
+                    process_row(begins[0] + row * strides[0], tid);
+                });
+            } else {
+                #pragma omp parallel for schedule(static)
+                for (size_t i = begins[0]; i < ends[0]; i += strides[0]) {
+                    process_row(i, omp_get_thread_num());
+                }
             }
             // if (n % 2 == 0) {
             //     begins[direction] = n - 1;
@@ -2826,9 +3119,8 @@ template <COMPMODE CompMode, bool SkipOverwrite, class QuantizeFunc>
             strides[direction] = 2;
             size_t vector_len = ends[2] > begins[2] ? (ends[2]-begins[2]-1)/strides[2] + 1 : 0;
 
-            #pragma omp parallel for
-            for (size_t i = begins[0]; i < ends[0]; i += strides[0]) {
-                int tid = omp_get_thread_num();
+            const size_t rows = coarse_trip_count(begins[0], ends[0], strides[0]);
+            auto process_row = [&](size_t i, int tid) {
                 auto buffer_offset = buffer_len * tid;
                 auto cur_buffer_1 = interp_buffer_1 + buffer_offset;
                 auto cur_buffer_2 = interp_buffer_2 + buffer_offset;
@@ -2900,7 +3192,11 @@ template <COMPMODE CompMode, bool SkipOverwrite, class QuantizeFunc>
                         cur_buffer_4 = temp_buffer;
 
                         buffer_idx = 0;
-                        for (size_t k = begins[2]; k < ends[2]; k += strides[2]) {
+                        if (packing_detail::use_yz<T>(strides[2], vector_len)) {
+                            // j+3 is an even grid row, untouched by this sweep.
+                            packing_detail::copy_stride2(cur_buffer_4,
+                                data + cur_ij_offset + stride3x + begins[2], vector_len);
+                        } else for (size_t k = begins[2]; k < ends[2]; k += strides[2]) {
                             auto cur_offset =  cur_ij_offset + stride3x + k;
                            // if (visited[cur_offset]==0 )
                             //   std::cout<<"e2 "<<i<<" "<<j<<" "<<k<<" "<<cur_offset<<std::endl;
@@ -2950,6 +3246,16 @@ template <COMPMODE CompMode, bool SkipOverwrite, class QuantizeFunc>
                         //     data + cur_ij_offset, strides[2], cur_ij_offset, tid);
                     // }
                 }
+            };
+            if (coarse_region_is_small(rows, vector_len, n / 2)) {
+                coarse_for_logical_threads(rows, [&](size_t row, int tid) {
+                    process_row(begins[0] + row * strides[0], tid);
+                });
+            } else {
+                #pragma omp parallel for schedule(static)
+                for (size_t i = begins[0]; i < ends[0]; i += strides[0]) {
+                    process_row(i, omp_get_thread_num());
+                }
             }
 
             std::vector<size_t> boundaries;
@@ -2967,8 +3273,7 @@ template <COMPMODE CompMode, bool SkipOverwrite, class QuantizeFunc>
             for (auto boundary : boundaries) {
                 begins[direction] = boundary;
                 ends[direction] = boundary + 1;
-                foreach_omp2
-                    <T, N>(data, offset, begins, ends, strides, dim_offsets, [&](T *d, int tid) {
+                auto process_boundary = [&](T *d, int tid) {
                         if (boundary >= 3) {
                             if (boundary + 3 < n)
                                 quantize_func(
@@ -2988,7 +3293,20 @@ template <COMPMODE CompMode, bool SkipOverwrite, class QuantizeFunc>
                             else
                                 quantize_point<CompMode, SkipOverwrite>(d - data, *d, *(d - stride), tid);
                         }
+                    };
+                if (coarse_region_is_small(rows, vector_len)) {
+                    coarse_for_logical_threads(rows, [&](size_t row, int tid) {
+                        const size_t i = begins[0] + row * strides[0];
+                        for (size_t j = begins[1]; j < ends[1]; j += strides[1]) {
+                            for (size_t k = begins[2]; k < ends[2]; k += strides[2]) {
+                                process_boundary(data + offset + i * dim_offsets[0] +
+                                                 j * dim_offsets[1] + k * dim_offsets[2], tid);
+                            }
+                        }
                     });
+                } else {
+                    foreach_stream_static(data, offset, begins, ends, strides, dim_offsets, process_boundary);
+                }
             }
         }
         return predict_error;
@@ -3048,10 +3366,9 @@ template <COMPMODE CompMode, bool SkipOverwrite, class QuantizeFunc>
             ends[direction] = n;
             strides[direction] = 2;
             // size_t odd_len = n/2;//, even_len = n - odd_len;
-            #pragma omp parallel for collapse(2) schedule(static)
-            for (size_t i = begins[0]; i < ends[0]; i += strides[0]) {
-                for(size_t j = begins[1]; j < ends[1]; j += strides[1]){
-                    int tid = omp_get_thread_num();
+            const size_t rows = coarse_trip_count(begins[0], ends[0], strides[0]);
+            const size_t columns = coarse_trip_count(begins[1], ends[1], strides[1]);
+            auto process_line = [&](size_t i, size_t j, int tid) {
                     auto cur_ij_offset = offset + i * dim_offsets[0] + j * dim_offsets[1];
                     if (n >= 64) {
                         auto even_buffer = interp_buffer_1 + buffer_len * tid;
@@ -3075,6 +3392,18 @@ template <COMPMODE CompMode, bool SkipOverwrite, class QuantizeFunc>
 
                     // }
 
+            };
+            if (coarse_region_is_small(rows, columns, n / 2)) {
+                coarse_for_logical_threads(rows * columns, [&](size_t line, int tid) {
+                    process_line(begins[0] + (line / columns) * strides[0],
+                                 begins[1] + (line % columns) * strides[1], tid);
+                });
+            } else {
+                #pragma omp parallel for collapse(2) schedule(static)
+                for (size_t i = begins[0]; i < ends[0]; i += strides[0]) {
+                    for (size_t j = begins[1]; j < ends[1]; j += strides[1]) {
+                        process_line(i, j, omp_get_thread_num());
+                    }
                 }
             }
         } else {
@@ -3084,10 +3413,9 @@ template <COMPMODE CompMode, bool SkipOverwrite, class QuantizeFunc>
             ends[direction] = n;
             strides[direction] = 2;
             // size_t odd_len = n/2;//, even_len = n - odd_len;
-            #pragma omp parallel for collapse(2) schedule(static)
-            for (size_t i = begins[0]; i < ends[0]; i += strides[0]) {
-                for(size_t j = begins[1]; j < ends[1]; j += strides[1]){
-                    int tid = omp_get_thread_num();
+            const size_t rows = coarse_trip_count(begins[0], ends[0], strides[0]);
+            const size_t columns = coarse_trip_count(begins[1], ends[1], strides[1]);
+            auto process_line = [&](size_t i, size_t j, int tid) {
                     auto cur_ij_offset = offset + i * dim_offsets[0] + j * dim_offsets[1];
                     if (n >= 64) {
                         auto even_buffer = interp_buffer_1 + buffer_len * tid;
@@ -3112,6 +3440,18 @@ template <COMPMODE CompMode, bool SkipOverwrite, class QuantizeFunc>
 
                     // }
 
+            };
+            if (coarse_region_is_small(rows, columns, n / 2)) {
+                coarse_for_logical_threads(rows * columns, [&](size_t line, int tid) {
+                    process_line(begins[0] + (line / columns) * strides[0],
+                                 begins[1] + (line % columns) * strides[1], tid);
+                });
+            } else {
+                #pragma omp parallel for collapse(2) schedule(static)
+                for (size_t i = begins[0]; i < ends[0]; i += strides[0]) {
+                    for (size_t j = begins[1]; j < ends[1]; j += strides[1]) {
+                        process_line(i, j, omp_get_thread_num());
+                    }
                 }
             }
         }
@@ -3268,6 +3608,7 @@ template <COMPMODE CompMode, bool SkipOverwrite, class QuantizeFunc>
                 strides[dims[i]] = stride2x;
             }
             if constexpr (N == 3 && !std::is_integral_v<T>){//avx
+                // The dedicated kernels implement only the xyz and zyx orders.
                 if(direction == 0 ){//xyz
                     predict_error += interpolation_1d_simd_3d_z<CompMode, false>(data, begin_idx, end_idx, dims[0], strides, stride, interp_func, quantize_func);
                     begin_idx[1] = begin[1];
@@ -3278,8 +3619,9 @@ template <COMPMODE CompMode, bool SkipOverwrite, class QuantizeFunc>
                     begin_idx[1] = (begin[1] ? begin[1] + stride : 0);
                     strides[1] = stride;
                     predict_error += interpolation_1d_simd_3d_x<CompMode, SkipOverwrite>(data, begin_idx, end_idx, dims[2], strides, stride, interp_func, quantize_func);
+                    return predict_error;
                 }
-                else{//zyx
+                else if (direction == 5) {//zyx
                     predict_error += interpolation_1d_simd_3d_x<CompMode, false>(data, begin_idx, end_idx, dims[0], strides, stride, interp_func, quantize_func);
                     begin_idx[1] = begin[1];
                     begin_idx[2] = (begin[2] ? begin[2] + stride : 0);
@@ -3292,19 +3634,17 @@ template <COMPMODE CompMode, bool SkipOverwrite, class QuantizeFunc>
                     strides[1] = stride;
                     strides[2] = stride;
                     predict_error += interpolation_1d_simd_3d_z<CompMode, SkipOverwrite>(data, begin_idx, end_idx, dims[2], strides, stride, interp_func, quantize_func);
+                    return predict_error;
                 }
-
             }
 
-            else{
-                predict_error += interpolation_1d_fastest_dim_first(data, begin_idx, end_idx, dims[0], strides, stride, interp_func, quantize_func);
-                for (uint i = 1; i < N; ++i) {
+            predict_error += interpolation_1d_fastest_dim_first(data, begin_idx, end_idx, dims[0], strides, stride, interp_func, quantize_func);
+            for (uint i = 1; i < N; ++i) {
                 begin_idx[dims[i]] = begin[dims[i]];
                 begin_idx[dims[i - 1]] = (begin[dims[i - 1]] ? begin[dims[i - 1]] + stride : 0);
                 strides[dims[i - 1]] = stride;
 
                 predict_error += interpolation_1d_fastest_dim_first(data, begin_idx, end_idx, dims[i], strides, stride, interp_func, quantize_func);
-                }
             }
 // #ifdef Falcons_PRINT_TIMINGS
 //             timer.stop("interpolation");
@@ -3351,6 +3691,7 @@ template <COMPMODE CompMode, bool SkipOverwrite, class QuantizeFunc>
     int16_t* total_quant_inds;
     int16_t** local_quant_inds;
     CacheLineInt* local_quant_index;
+    size_t local_stream_capacity = 0;
 #ifdef __AVX2__
     // for avx
     __m256d radius_avx;

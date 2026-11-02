@@ -143,7 +143,7 @@ TEST(QuantizerTest, Int64SignedResiduals) {
     EXPECT_EQ(unchanged, std::numeric_limits<int64_t>::max());
 }
 
-TEST(QuantizerTest, IntegralStreamUidAndLegacyDecode) {
+TEST(QuantizerTest, IntegralStreamUidAndDecode) {
     Falcons::LinearQuantizer<uint64_t> quantizer(100.0);
     std::vector<unsigned char> buffer(256);
     unsigned char *save_ptr = buffer.data();
@@ -159,16 +159,6 @@ TEST(QuantizerTest, IntegralStreamUidAndLegacyDecode) {
     constexpr int quant_index = 5;
     const uint64_t integral_reconstruction = large_pred + 1000;
     EXPECT_EQ(loaded.recover(large_pred, quant_index), integral_reconstruction);
-
-    buffer[0] = 0b10;
-    Falcons::LinearQuantizer<uint64_t> legacy(1.0);
-    load_ptr = buffer.data();
-    remaining = saved_size;
-    legacy.load(load_ptr, remaining);
-    const uint64_t legacy_reconstruction = static_cast<uint64_t>(
-        std::fma(static_cast<double>(quant_index), 200.0, static_cast<double>(large_pred)));
-    EXPECT_EQ(legacy.recover(large_pred, quant_index), legacy_reconstruction);
-    EXPECT_NE(legacy_reconstruction, integral_reconstruction);
 
     Falcons::LinearQuantizer<float> float_quantizer(100.0);
     save_ptr = buffer.data();

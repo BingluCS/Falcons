@@ -101,7 +101,45 @@ inline void avx2_minmax(const T *data, size_t begin, size_t end, T &out_min, T &
         __m256 vmin = _mm256_set1_ps(data[begin]);
 
         size_t i = begin;
-        for (; i + 8 <= end; i += 8) {
+        if (begin <= end && end - begin >= 32) {
+            __m256 vmax1 = vmax, vmax2 = vmax, vmax3 = vmax;
+            __m256 vmin1 = vmin, vmin2 = vmin, vmin3 = vmin;
+            __m256 unordered = _mm256_setzero_ps();
+            for (; end - i >= 32; i += 32) {
+                const __m256 v0 = _mm256_loadu_ps(data + i);
+                const __m256 v1 = _mm256_loadu_ps(data + i + 8);
+                const __m256 v2 = _mm256_loadu_ps(data + i + 16);
+                const __m256 v3 = _mm256_loadu_ps(data + i + 24);
+                vmax = _mm256_max_ps(vmax, v0);
+                vmin = _mm256_min_ps(vmin, v0);
+                vmax1 = _mm256_max_ps(vmax1, v1);
+                vmin1 = _mm256_min_ps(vmin1, v1);
+                vmax2 = _mm256_max_ps(vmax2, v2);
+                vmin2 = _mm256_min_ps(vmin2, v2);
+                vmax3 = _mm256_max_ps(vmax3, v3);
+                vmin3 = _mm256_min_ps(vmin3, v3);
+                unordered = _mm256_or_ps(unordered, _mm256_or_ps(
+                    _mm256_cmp_ps(v0, v1, _CMP_UNORD_Q), _mm256_cmp_ps(v2, v3, _CMP_UNORD_Q)));
+            }
+            vmax = _mm256_max_ps(_mm256_max_ps(vmax, vmax1), _mm256_max_ps(vmax2, vmax3));
+            vmin = _mm256_min_ps(_mm256_min_ps(vmin, vmin1), _mm256_min_ps(vmin2, vmin3));
+            for (; end - i >= 8; i += 8) {
+                const __m256 v = _mm256_loadu_ps(data + i);
+                vmax = _mm256_max_ps(vmax, v);
+                vmin = _mm256_min_ps(vmin, v);
+                unordered = _mm256_or_ps(unordered, _mm256_cmp_ps(v, v, _CMP_UNORD_Q));
+            }
+
+            // Regrouping MIN/MAX can change NaN and signed-zero selection.
+            const __m256 zero_extrema = _mm256_or_ps(
+                _mm256_cmp_ps(vmin, _mm256_setzero_ps(), _CMP_EQ_OQ),
+                _mm256_cmp_ps(vmax, _mm256_setzero_ps(), _CMP_EQ_OQ));
+            if (_mm256_movemask_ps(_mm256_or_ps(unordered, zero_extrema)) != 0) {
+                vmax = vmin = _mm256_set1_ps(data[begin]);
+                i = begin;
+            }
+        }
+        for (; i < end && end - i >= 8; i += 8) {
             const __m256 v = _mm256_loadu_ps(data + i);
             vmax = _mm256_max_ps(vmax, v);
             vmin = _mm256_min_ps(vmin, v);
@@ -128,7 +166,44 @@ inline void avx2_minmax(const T *data, size_t begin, size_t end, T &out_min, T &
         __m256d vmin = _mm256_set1_pd(data[begin]);
 
         size_t i = begin;
-        for (; i + 4 <= end; i += 4) {
+        if (begin <= end && end - begin >= 16) {
+            __m256d vmax1 = vmax, vmax2 = vmax, vmax3 = vmax;
+            __m256d vmin1 = vmin, vmin2 = vmin, vmin3 = vmin;
+            __m256d unordered = _mm256_setzero_pd();
+            for (; end - i >= 16; i += 16) {
+                const __m256d v0 = _mm256_loadu_pd(data + i);
+                const __m256d v1 = _mm256_loadu_pd(data + i + 4);
+                const __m256d v2 = _mm256_loadu_pd(data + i + 8);
+                const __m256d v3 = _mm256_loadu_pd(data + i + 12);
+                vmax = _mm256_max_pd(vmax, v0);
+                vmin = _mm256_min_pd(vmin, v0);
+                vmax1 = _mm256_max_pd(vmax1, v1);
+                vmin1 = _mm256_min_pd(vmin1, v1);
+                vmax2 = _mm256_max_pd(vmax2, v2);
+                vmin2 = _mm256_min_pd(vmin2, v2);
+                vmax3 = _mm256_max_pd(vmax3, v3);
+                vmin3 = _mm256_min_pd(vmin3, v3);
+                unordered = _mm256_or_pd(unordered, _mm256_or_pd(
+                    _mm256_cmp_pd(v0, v1, _CMP_UNORD_Q), _mm256_cmp_pd(v2, v3, _CMP_UNORD_Q)));
+            }
+            vmax = _mm256_max_pd(_mm256_max_pd(vmax, vmax1), _mm256_max_pd(vmax2, vmax3));
+            vmin = _mm256_min_pd(_mm256_min_pd(vmin, vmin1), _mm256_min_pd(vmin2, vmin3));
+            for (; end - i >= 4; i += 4) {
+                const __m256d v = _mm256_loadu_pd(data + i);
+                vmax = _mm256_max_pd(vmax, v);
+                vmin = _mm256_min_pd(vmin, v);
+                unordered = _mm256_or_pd(unordered, _mm256_cmp_pd(v, v, _CMP_UNORD_Q));
+            }
+
+            const __m256d zero_extrema = _mm256_or_pd(
+                _mm256_cmp_pd(vmin, _mm256_setzero_pd(), _CMP_EQ_OQ),
+                _mm256_cmp_pd(vmax, _mm256_setzero_pd(), _CMP_EQ_OQ));
+            if (_mm256_movemask_pd(_mm256_or_pd(unordered, zero_extrema)) != 0) {
+                vmax = vmin = _mm256_set1_pd(data[begin]);
+                i = begin;
+            }
+        }
+        for (; i < end && end - i >= 4; i += 4) {
             const __m256d v = _mm256_loadu_pd(data + i);
             vmax = _mm256_max_pd(vmax, v);
             vmin = _mm256_min_pd(vmin, v);
@@ -158,6 +233,7 @@ inline void avx2_minmax(const T *data, size_t begin, size_t end, T &out_min, T &
 
 template <class T>
 T data_range(const T *data, size_t num, const bool enable_parallel = true) {
+    if (num == 0) return T(0);
     if (num <= 16) {
         T min_val, max_val;
         scalar_minmax(data, 0, num, min_val, max_val);
@@ -166,7 +242,35 @@ T data_range(const T *data, size_t num, const bool enable_parallel = true) {
 
     T min_val = data[0];
     T max_val = data[0];
-    if (!enable_parallel) {
+#ifndef _OPENMP
+    (void)enable_parallel;
+#else
+    if (enable_parallel) {
+        #pragma omp parallel reduction(min:min_val) reduction(max:max_val)
+        {
+            const size_t thread_count = static_cast<size_t>(omp_get_num_threads());
+            const size_t thread_id = static_cast<size_t>(omp_get_thread_num());
+            const size_t base = num / thread_count;
+            const size_t remain = num % thread_count;
+            const size_t begin = thread_id * base + std::min(thread_id, remain);
+            const size_t end = begin + base + (thread_id < remain ? 1 : 0);
+
+            if (begin < end) {
+                T local_min, local_max;
+#ifdef __ARM_FEATURE_SVE2
+                sve2_minmax(data, begin, end, local_min, local_max);
+#elif defined(__AVX2__)
+                avx2_minmax(data, begin, end, local_min, local_max);
+#else
+                scalar_minmax(data, begin, end, local_min, local_max);
+#endif
+                min_val = std::min(min_val, local_min);
+                max_val = std::max(max_val, local_max);
+            }
+        }
+    } else
+#endif
+    {
 #ifdef __ARM_FEATURE_SVE2
         sve2_minmax(data, 0, num, min_val, max_val);
 #elif defined(__AVX2__)
@@ -174,32 +278,7 @@ T data_range(const T *data, size_t num, const bool enable_parallel = true) {
 #else
         scalar_minmax(data, 0, num, min_val, max_val);
 #endif
-        return max_val - min_val;
     }
-#ifdef _OPENMP
-    #pragma omp parallel reduction(min:min_val) reduction(max:max_val)
-    {
-        const size_t thread_count = static_cast<size_t>(omp_get_num_threads());
-        const size_t thread_id = static_cast<size_t>(omp_get_thread_num());
-        const size_t base = num / thread_count;
-        const size_t remain = num % thread_count;
-        const size_t begin = thread_id * base + std::min(thread_id, remain);
-        const size_t end = begin + base + (thread_id < remain ? 1 : 0);
-
-        if (begin < end) {
-            T local_min, local_max;
-#ifdef __ARM_FEATURE_SVE2
-            sve2_minmax(data, begin, end, local_min, local_max);
-#elif defined(__AVX2__)
-            avx2_minmax(data, begin, end, local_min, local_max);
-#else
-            scalar_minmax(data, begin, end, local_min, local_max);
-#endif
-            min_val = std::min(min_val, local_min);
-            max_val = std::max(max_val, local_max);
-        }
-    }
-#endif
     return max_val - min_val;
 }
 

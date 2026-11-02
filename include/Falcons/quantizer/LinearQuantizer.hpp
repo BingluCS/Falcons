@@ -119,15 +119,14 @@ class LinearQuantizer : public concepts::QuantizerInterface<T, int> {
 
     ALWAYS_INLINE T recover_pred(T pred, int quant_index) {
         if constexpr (std::is_integral_v<T>) {
-            if (!legacy_integral_stream) {
-                T recovered;
-                if (!recover_integral(pred, quant_index, recovered))
-                    throw std::runtime_error("LinearQuantizer integral reconstruction overflow");
-                return recovered;
-            }
+            T recovered;
+            if (!recover_integral(pred, quant_index, recovered))
+                throw std::runtime_error("LinearQuantizer integral reconstruction overflow");
+            return recovered;
+        } else {
+            // Must match quantize_and_overwrite's fused f64 reconstruction.
+            return static_cast<T>(std::fma(static_cast<double>(quant_index), this->double_error_bound, static_cast<double>(pred)));
         }
-        // must match quantize_and_overwrite's dequant exactly (fused, f64)
-        return static_cast<T>(std::fma(static_cast<double>(quant_index), this->double_error_bound, static_cast<double>(pred)));
     }
 
     ALWAYS_INLINE T recover_unpred() { return unpred[index++]; }
@@ -154,18 +153,9 @@ class LinearQuantizer : public concepts::QuantizerInterface<T, int> {
     void load(const unsigned char *&c, size_t &remaining_length) override {
         uchar uid_read;
         read(uid_read, c, remaining_length);
-        if constexpr (std::is_integral_v<T>) {
-            if (uid_read == integral_uid) {
-                legacy_integral_stream = false;
-            } else if (uid_read == uid) {
-                legacy_integral_stream = true;
-            } else {
-                throw std::invalid_argument("LinearQuantizer uid mismatch");
-            }
-        } else {
-            if (uid_read != uid)
-                throw std::invalid_argument("LinearQuantizer uid mismatch");
-        }
+        const uchar expected_uid = std::is_integral_v<T> ? integral_uid : uid;
+        if (uid_read != expected_uid)
+            throw std::invalid_argument("LinearQuantizer uid mismatch");
         double eb;
         read(eb, c, remaining_length);
         set_eb(eb);
@@ -251,8 +241,6 @@ class LinearQuantizer : public concepts::QuantizerInterface<T, int> {
     size_t index = 0;  // used in decompression only
     static constexpr uchar uid = 0b10;
     static constexpr uchar integral_uid = 0b100;
-    bool legacy_integral_stream = false;
-
     double error_bound;
     double double_error_bound;
     double double_error_bound_reciprocal;

@@ -126,16 +126,6 @@ inline void Falcons_read_config(Falcons::Config &config, const char *cmpData, si
     if (config.falconsMagicNumber != Falcons_MAGIC_NUMBER) {
         throw std::invalid_argument("magic number mismatch, the input data is not compressed by Falcons");
     }
-    if (versionStr(config.falconsDataVer) != Falcons_DATA_VER) {
-        std::stringstream ss;
-        printf("program v%s , program-data %s , input data v%s\n", Falcons_VER, Falcons_DATA_VER,
-               versionStr(config.falconsDataVer).data());
-        ss << "Please use Falcons v" << versionStr(config.falconsDataVer) << " to decompress the data" << std::endl;
-        std::cerr << ss.str();
-        throw std::invalid_argument(ss.str());
-    }
-
-
     if (cmpSize <= static_cast<size_t>(static_cast<unsigned char>(cmpData[0])))
         throw std::invalid_argument("Missing Falcons compressed payload");
 }

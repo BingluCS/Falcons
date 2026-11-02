@@ -27,6 +27,180 @@ namespace Falcons {
     }
 #endif // Falcons_QUANT16_HELPERS
 
+#ifndef Falcons_AVX2_STRIDE2_HELPERS
+#define Falcons_AVX2_STRIDE2_HELPERS
+#ifdef Falcons_AVX_TEST_SCALAR_GATHERS
+    static constexpr bool avx2_stride2_loads_enabled = false;
+#else
+    static constexpr bool avx2_stride2_loads_enabled = true;
+#endif
+
+    // Interleaved values must not be concurrently written by another thread.
+    // Read exactly p[0..14], ending at the last selected float, not p[15].
+    static ALWAYS_INLINE __m256 avx2_load_stride2(const float* p) {
+        const __m256 a = _mm256_loadu_ps(p);
+        const __m256 b = _mm256_loadu_ps(p + 7);
+        const __m256 mixed = _mm256_shuffle_ps(a, b, _MM_SHUFFLE(3, 1, 2, 0));
+        // [0,2,8,10 | 4,6,12,14] -> [0,2,4,6 | 8,10,12,14].
+        return _mm256_castpd_ps(_mm256_permute4x64_pd(_mm256_castps_pd(mixed), 0xD8));
+    }
+
+    // Read exactly p[0..6], ending at the last selected double, not p[7].
+    static ALWAYS_INLINE __m256d avx2_load_stride2(const double* p) {
+        const __m256d a = _mm256_loadu_pd(p);
+        const __m256d b = _mm256_loadu_pd(p + 3);
+        const __m256d mixed = _mm256_shuffle_pd(a, b, 0xA); // [0,4,2,6]
+        return _mm256_permute4x64_pd(mixed, 0xD8);
+    }
+#endif // Falcons_AVX2_STRIDE2_HELPERS
+
+#ifndef Falcons_AVX2_CUBIC_LINE_LOAD_CONTROL
+#define Falcons_AVX2_CUBIC_LINE_LOAD_CONTROL
+    // Cubic DECOMP's first wide load overlaps the preceding batch's last target.
+    template <COMPMODE CompMode>
+    static constexpr bool avx2_cubic_line_stride2_loads_enabled =
+        avx2_stride2_loads_enabled &&
+#ifdef Falcons_AVX_TEST_C8_CUBIC_DECOMP_LOADS
+        true;
+#else
+        CompMode != COMPMODE::DECOMP;
+#endif
+#endif // Falcons_AVX2_CUBIC_LINE_LOAD_CONTROL
+
+#ifndef Falcons_AVX2_STRIDE2_STORE_HELPERS
+#define Falcons_AVX2_STRIDE2_STORE_HELPERS
+#ifdef Falcons_AVX_TEST_SCALAR_STORES
+    static constexpr bool avx2_stride2_stores_enabled = false;
+#else
+    static constexpr bool avx2_stride2_stores_enabled = true;
+#endif
+
+    // Complementary masks write only p[2*k], with no destination reads.
+    // Both complete vector spans end at or before the last selected lane.
+    static ALWAYS_INLINE void avx2_store_stride2(float* p, __m256 value) {
+        const __m256i even = _mm256_setr_epi32(-1, 0, -1, 0, -1, 0, -1, 0);
+        const __m256i odd = _mm256_setr_epi32(0, -1, 0, -1, 0, -1, 0, -1);
+        const __m256 pairs = _mm256_castpd_ps(
+            _mm256_permute4x64_pd(_mm256_castps_pd(value), 0xD8));
+        _mm256_maskstore_ps(p, even, _mm256_unpacklo_ps(pairs, pairs));
+        _mm256_maskstore_ps(p + 7, odd, _mm256_unpackhi_ps(pairs, pairs));
+    }
+
+    static ALWAYS_INLINE void avx2_store_stride2(double* p, __m256d value) {
+        const __m256i even = _mm256_setr_epi64x(-1, 0, -1, 0);
+        const __m256i odd = _mm256_setr_epi64x(0, -1, 0, -1);
+        _mm256_maskstore_pd(p, even, _mm256_permute4x64_pd(value, _MM_SHUFFLE(1, 1, 0, 0)));
+        _mm256_maskstore_pd(p + 3, odd, _mm256_permute4x64_pd(value, _MM_SHUFFLE(3, 3, 2, 2)));
+    }
+
+    static ALWAYS_INLINE void avx2_store_stride2(float* p, const float* values) {
+        avx2_store_stride2(p, _mm256_loadu_ps(values));
+    }
+
+    static ALWAYS_INLINE void avx2_store_stride2(double* p, const double* values) {
+        avx2_store_stride2(p, _mm256_loadu_pd(values));
+    }
+#endif // Falcons_AVX2_STRIDE2_STORE_HELPERS
+
+#ifndef Falcons_AVX2_ZERO_CODE_HELPERS
+#define Falcons_AVX2_ZERO_CODE_HELPERS
+    template <bool SkipOverwrite>
+    static constexpr bool avx2_zero_code_enabled =
+#ifdef Falcons_AVX_TEST_ZERO_SKIP_ONLY
+        SkipOverwrite;
+#else
+        true;
+#endif
+
+    static ALWAYS_INLINE __m256d avx2_zero_code_reconstruct(__m256d diff, __m256d pred, __m256d ebx2) {
+        const __m256d q = _mm256_and_pd(diff, _mm256_set1_pd(-0.0));
+        return _mm256_fmadd_pd(q, ebx2, pred);
+    }
+
+    static ALWAYS_INLINE __m256 avx2_zero_code_reconstruct(__m256 diff, __m256 pred, __m256d ebx2) {
+#ifdef Falcons_AVX_TEST_NATIVE_ZERO_RECONSTRUCT
+        const __m256 q = _mm256_and_ps(diff, _mm256_set1_ps(-0.0f));
+        const __m256d low = _mm256_fmadd_pd(
+            _mm256_cvtps_pd(_mm256_castps256_ps128(q)), ebx2,
+            _mm256_cvtps_pd(_mm256_castps256_ps128(pred)));
+        const __m256d high = _mm256_fmadd_pd(
+            _mm256_cvtps_pd(_mm256_extractf128_ps(q, 1)), ebx2,
+            _mm256_cvtps_pd(_mm256_extractf128_ps(pred, 1)));
+        return _mm256_insertf128_ps(_mm256_castps128_ps256(_mm256_cvtpd_ps(low)),
+                                   _mm256_cvtpd_ps(high), 1);
+#else
+        // The RN/gradual, finite-positive-step guard makes zero-product FMA
+        // preserve nonzero pred; for pred=+/-0 its sign is pred.sign AND diff.sign.
+        const __m256 zero = _mm256_castpd_ps(_mm256_cmp_pd(ebx2, _mm256_setzero_pd(), _CMP_EQ_OQ));
+        const __m256 is_zero = _mm256_cmp_ps(pred, zero, _CMP_EQ_OQ);
+        return _mm256_blendv_ps(pred, _mm256_and_ps(pred, diff), is_zero);
+#endif
+    }
+
+    static ALWAYS_INLINE double avx2_zero_code_product(double bound, double reciprocal) {
+        return _mm_cvtsd_f64(_mm_mul_sd(_mm_set_sd(bound), _mm_set_sd(reciprocal)));
+    }
+
+    // A negative bound disables every lane. Prepare once on the executing thread.
+    template <bool Enabled>
+    static ALWAYS_INLINE __m256d avx2_zero_code_bound(__m256d eb_avx, __m256d neb_avx,
+                                                     double ebx2, double reciprocal, int radius, bool full_batch) {
+        if constexpr (Enabled) {
+            if (full_batch && !(_mm_getcsr() & (_MM_ROUND_MASK | _MM_FLUSH_ZERO_MASK | _MM_DENORMALS_ZERO_MASK))) {
+                const double eb = _mm_cvtsd_f64(_mm256_castpd256_pd128(eb_avx));
+                const double neb = _mm_cvtsd_f64(_mm256_castpd256_pd128(neb_avx));
+                double bound = std::min(eb, -neb);
+                if (radius > 0 && eb > 0 && std::isfinite(eb) && neb < 0 && std::isfinite(neb) &&
+                    std::isnormal(bound) && ebx2 > 0 && std::isfinite(ebx2) &&
+                    reciprocal > 0 && std::isfinite(reciprocal)) {
+                    double product = avx2_zero_code_product(bound, reciprocal);
+                    if (product > 0.5) {
+                        bound = std::nextafter(bound, 0.0);
+                        product = avx2_zero_code_product(bound, reciprocal);
+                    }
+                    if (std::isnormal(bound) && product <= 0.5) return _mm256_set1_pd(bound);
+                }
+            }
+        }
+        return _mm256_set1_pd(-1.0);
+    }
+
+    template <bool Enabled>
+    static ALWAYS_INLINE __m256 avx2_zero_code_bound(__m256 eb_avx, __m256 neb_avx,
+                                                    double ebx2, double reciprocal, int radius, bool full_batch) {
+        if constexpr (Enabled) {
+            if (full_batch && !(_mm_getcsr() & (_MM_ROUND_MASK | _MM_FLUSH_ZERO_MASK | _MM_DENORMALS_ZERO_MASK))) {
+                const float eb = _mm_cvtss_f32(_mm256_castps256_ps128(eb_avx));
+                const float neb = _mm_cvtss_f32(_mm256_castps256_ps128(neb_avx));
+                float bound = std::min(eb, -neb);
+                if (radius > 0 && eb > 0 && std::isfinite(eb) && neb < 0 && std::isfinite(neb) &&
+                    std::isnormal(bound) && ebx2 > 0 && std::isfinite(ebx2) &&
+                    reciprocal > 0 && std::isfinite(reciprocal)) {
+                    double product = avx2_zero_code_product(static_cast<double>(bound), reciprocal);
+                    if (product > 0.5) {
+                        bound = std::nextafter(bound, 0.0f);
+                        product = avx2_zero_code_product(static_cast<double>(bound), reciprocal);
+                    }
+                    if (std::isnormal(bound) && product <= 0.5) return _mm256_set1_ps(bound);
+                }
+            }
+        }
+        return _mm256_set1_ps(-1.0f);
+    }
+
+    // RN multiplication is monotone, so this bound guarantees nearest-even q=0
+    // and an accepted reconstruction error. Nonfinite lanes stay on the native path.
+    static ALWAYS_INLINE bool is_avx2_zero_code_batch(__m256d diff, __m256d bound) {
+        const __m256d magnitude = _mm256_andnot_pd(_mm256_set1_pd(-0.0), diff);
+        return _mm256_movemask_pd(_mm256_cmp_pd(magnitude, bound, _CMP_LE_OQ)) == 0xf;
+    }
+
+    static ALWAYS_INLINE bool is_avx2_zero_code_batch(__m256 diff, __m256 bound) {
+        const __m256 magnitude = _mm256_andnot_ps(_mm256_set1_ps(-0.0f), diff);
+        return _mm256_movemask_ps(_mm256_cmp_ps(magnitude, bound, _CMP_LE_OQ)) == 0xff;
+    }
+#endif // Falcons_AVX2_ZERO_CODE_HELPERS
+
     template <class T, uint N, class QuantizerOMP>
     template<typename U, typename>
     ALWAYS_INLINE void InterpolationDecomposition_OMP<T, N, QuantizerOMP>::quantize_1D_float (__m256& sum, __m256& ori_avx, __m256& quant_avx, T tmp[8]) {
@@ -130,17 +304,28 @@ namespace Falcons {
                 }
                 i = vec_chunks * step;
             } else {
+                const __m256 zero_bound = avx2_zero_code_bound<CompMode == COMPMODE::COMP && avx2_zero_code_enabled<SkipOverwrite>>(
+                    rel_eb_avx_f, nrel_eb_avx_f, real_ebx2, real_ebx2_r, radius, odd_len > step);
                 for (; i + step < odd_len; i += step) {
-                    T a[8], b[8];
-                    #pragma unroll
-                    for (size_t j = 0; j < step; ++j) {
-                        size_t even = (i + j) << 1;
-                        a[j] = data[cur_ij_offset + even * offset];
-                        b[j] = data[cur_ij_offset + (even + 2) * offset];
+                    __m256 va, vb;
+                    if (avx2_stride2_loads_enabled && offset == 1) {
+                        const T* p = data + cur_ij_offset + (i << 1);
+                        va = avx2_load_stride2(p);
+                        vb = avx2_load_stride2(p + 2);
+                    } else {
+                        T a[8], b[8];
+                        #pragma unroll
+                        for (size_t j = 0; j < step; ++j) {
+                            size_t even = (i + j) << 1;
+                            a[j] = data[cur_ij_offset + even * offset];
+                            b[j] = data[cur_ij_offset + (even + 2) * offset];
+                        }
+                        va = _mm256_loadu_ps(a);
+                        vb = _mm256_loadu_ps(b);
                     }
-                    __m256 sum = _mm256_mul_ps(_mm256_add_ps(_mm256_loadu_ps(a), _mm256_loadu_ps(b)), factor);
+                    __m256 sum = _mm256_mul_ps(_mm256_add_ps(va, vb), factor);
                     size_t start = i;
-                    quantize_float<CompMode, step, false, SkipOverwrite>(sum, start, odd_data, odd_offset, odd_len, tid);
+                    quantize_float<CompMode, step, false, SkipOverwrite>(sum, start, odd_data, odd_offset, odd_len, tid, &zero_bound);
                 }
             }
         } else if constexpr (std::is_same_v<T, double>) {
@@ -165,17 +350,28 @@ namespace Falcons {
                 }
                 i = vec_chunks * step;
             } else {
+                const __m256d zero_bound = avx2_zero_code_bound<CompMode == COMPMODE::COMP && avx2_zero_code_enabled<SkipOverwrite>>(
+                    rel_eb_avx_d, nrel_eb_avx_d, real_ebx2, real_ebx2_r, radius, odd_len > step);
                 for (; i + step < odd_len; i += step) {
-                    T a[4], b[4];
-                    #pragma unroll
-                    for (size_t j = 0; j < step; ++j) {
-                        size_t even = (i + j) << 1;
-                        a[j] = data[cur_ij_offset + even * offset];
-                        b[j] = data[cur_ij_offset + (even + 2) * offset];
+                    __m256d va, vb;
+                    if (avx2_stride2_loads_enabled && offset == 1) {
+                        const T* p = data + cur_ij_offset + (i << 1);
+                        va = avx2_load_stride2(p);
+                        vb = avx2_load_stride2(p + 2);
+                    } else {
+                        T a[4], b[4];
+                        #pragma unroll
+                        for (size_t j = 0; j < step; ++j) {
+                            size_t even = (i + j) << 1;
+                            a[j] = data[cur_ij_offset + even * offset];
+                            b[j] = data[cur_ij_offset + (even + 2) * offset];
+                        }
+                        va = _mm256_loadu_pd(a);
+                        vb = _mm256_loadu_pd(b);
                     }
-                    __m256d sum = _mm256_mul_pd(_mm256_add_pd(_mm256_loadu_pd(a), _mm256_loadu_pd(b)), factor);
+                    __m256d sum = _mm256_mul_pd(_mm256_add_pd(va, vb), factor);
                     size_t start = i;
-                    quantize_double<CompMode, step, false, SkipOverwrite>(sum, start, odd_data, odd_offset, odd_len, tid);
+                    quantize_double<CompMode, step, false, SkipOverwrite>(sum, start, odd_data, odd_offset, odd_len, tid, &zero_bound);
                 }
             }
         }
@@ -249,24 +445,38 @@ namespace Falcons {
                 }
                 i = vec_chunks * step;
             } else {
+                const __m256 zero_bound = avx2_zero_code_bound<CompMode == COMPMODE::COMP && avx2_zero_code_enabled<SkipOverwrite>>(
+                    rel_eb_avx_f, nrel_eb_avx_f, real_ebx2, real_ebx2_r, radius, even_len > step + 2);
                 for (; i + step + 2 < even_len; i += step) {
-                    T a[8], b[8], c[8], d[8];
-                    #pragma unroll
-                    for (size_t j = 0; j < step; ++j) {
-                        size_t even = (i + j) << 1;
-                        a[j] = data[cur_ij_offset + even * offset];
-                        b[j] = data[cur_ij_offset + (even + 2) * offset];
-                        c[j] = data[cur_ij_offset + (even + 4) * offset];
-                        d[j] = data[cur_ij_offset + (even + 6) * offset];
+                    __m256 va, vb, vc, vd;
+                    if (avx2_cubic_line_stride2_loads_enabled<CompMode> && offset == 1) {
+                        const T* p = data + cur_ij_offset + (i << 1);
+                        va = avx2_load_stride2(p);
+                        vb = avx2_load_stride2(p + 2);
+                        vc = avx2_load_stride2(p + 4);
+                        vd = avx2_load_stride2(p + 6);
+                    } else {
+                        T a[8], b[8], c[8], d[8];
+                        #pragma unroll
+                        for (size_t j = 0; j < step; ++j) {
+                            size_t even = (i + j) << 1;
+                            a[j] = data[cur_ij_offset + even * offset];
+                            b[j] = data[cur_ij_offset + (even + 2) * offset];
+                            c[j] = data[cur_ij_offset + (even + 4) * offset];
+                            d[j] = data[cur_ij_offset + (even + 6) * offset];
+                        }
+                        va = _mm256_loadu_ps(a);
+                        vb = _mm256_loadu_ps(b);
+                        vc = _mm256_loadu_ps(c);
+                        vd = _mm256_loadu_ps(d);
                     }
                     __m256 sum = _mm256_mul_ps(
                         _mm256_sub_ps(
-                            _mm256_sub_ps(_mm256_mul_ps(_mm256_add_ps(_mm256_loadu_ps(b), _mm256_loadu_ps(c)), nine),
-                                          _mm256_loadu_ps(a)),
-                            _mm256_loadu_ps(d)),
+                            _mm256_sub_ps(_mm256_mul_ps(_mm256_add_ps(vb, vc), nine), va),
+                            vd),
                         factor);
                     size_t start = i + 1;
-                    quantize_float<CompMode, step, false, SkipOverwrite>(sum, start, odd_data, odd_offset, odd_len, tid);
+                    quantize_float<CompMode, step, false, SkipOverwrite>(sum, start, odd_data, odd_offset, odd_len, tid, &zero_bound);
                 }
             }
         } else if constexpr (std::is_same_v<T, double>) {
@@ -299,24 +509,38 @@ namespace Falcons {
                 }
                 i = vec_chunks * step;
             } else {
+                const __m256d zero_bound = avx2_zero_code_bound<CompMode == COMPMODE::COMP && avx2_zero_code_enabled<SkipOverwrite>>(
+                    rel_eb_avx_d, nrel_eb_avx_d, real_ebx2, real_ebx2_r, radius, even_len > step + 2);
                 for (; i + step + 2 < even_len; i += step) {
-                    T a[4], b[4], c[4], d[4];
-                    #pragma unroll
-                    for (size_t j = 0; j < step; ++j) {
-                        size_t even = (i + j) << 1;
-                        a[j] = data[cur_ij_offset + even * offset];
-                        b[j] = data[cur_ij_offset + (even + 2) * offset];
-                        c[j] = data[cur_ij_offset + (even + 4) * offset];
-                        d[j] = data[cur_ij_offset + (even + 6) * offset];
+                    __m256d va, vb, vc, vd;
+                    if (avx2_cubic_line_stride2_loads_enabled<CompMode> && offset == 1) {
+                        const T* p = data + cur_ij_offset + (i << 1);
+                        va = avx2_load_stride2(p);
+                        vb = avx2_load_stride2(p + 2);
+                        vc = avx2_load_stride2(p + 4);
+                        vd = avx2_load_stride2(p + 6);
+                    } else {
+                        T a[4], b[4], c[4], d[4];
+                        #pragma unroll
+                        for (size_t j = 0; j < step; ++j) {
+                            size_t even = (i + j) << 1;
+                            a[j] = data[cur_ij_offset + even * offset];
+                            b[j] = data[cur_ij_offset + (even + 2) * offset];
+                            c[j] = data[cur_ij_offset + (even + 4) * offset];
+                            d[j] = data[cur_ij_offset + (even + 6) * offset];
+                        }
+                        va = _mm256_loadu_pd(a);
+                        vb = _mm256_loadu_pd(b);
+                        vc = _mm256_loadu_pd(c);
+                        vd = _mm256_loadu_pd(d);
                     }
                     __m256d sum = _mm256_mul_pd(
                         _mm256_sub_pd(
-                            _mm256_sub_pd(_mm256_mul_pd(_mm256_add_pd(_mm256_loadu_pd(b), _mm256_loadu_pd(c)), nine),
-                                          _mm256_loadu_pd(a)),
-                            _mm256_loadu_pd(d)),
+                            _mm256_sub_pd(_mm256_mul_pd(_mm256_add_pd(vb, vc), nine), va),
+                            vd),
                         factor);
                     size_t start = i + 1;
-                    quantize_double<CompMode, step, false, SkipOverwrite>(sum, start, odd_data, odd_offset, odd_len, tid);
+                    quantize_double<CompMode, step, false, SkipOverwrite>(sum, start, odd_data, odd_offset, odd_len, tid, &zero_bound);
                 }
             }
         }
@@ -364,6 +588,8 @@ namespace Falcons {
 
         if constexpr (std::is_same_v<T, float>) {
             static constexpr size_t step = AVX_256_parallelism;
+            const __m256 zero_bound = avx2_zero_code_bound<CompMode == COMPMODE::COMP && avx2_zero_code_enabled<SkipOverwrite>>(
+                rel_eb_avx_f, nrel_eb_avx_f, real_ebx2, real_ebx2_r, radius, odd_len > step);
             const __m256 factor = _mm256_set1_ps(0.5f);
 
             for (; i + step < odd_len; i += step) {
@@ -375,32 +601,57 @@ namespace Falcons {
 
                 if constexpr (CompMode == COMPMODE::COMP) {
                     T ori[8];
-                    size_t base = start * offset;
-                    size_t offsetx2 = offset << 1;
-
-                    ori[0] = data[base];
-                    ori[1] = data[base + offsetx2];
-                    ori[2] = data[base + (offsetx2 << 1)];
-                    ori[3] = data[base + 3 * offsetx2];
-                    ori[4] = data[base + (offsetx2 << 2)];
-                    ori[5] = data[base + 5 * offsetx2];
-                    ori[6] = data[base + 6 * offsetx2];
-                    ori[7] = data[base + 7 * offsetx2];
-
-
-                    __m256 ori_avx = _mm256_loadu_ps(ori);
+                    __m256 ori_avx;
+                    if (avx2_stride2_loads_enabled && offset == 1) {
+                        ori_avx = avx2_load_stride2(data + start);
+                    } else {
+                        size_t base = start * offset;
+                        size_t offsetx2 = offset << 1;
+                        ori[0] = data[base];
+                        ori[1] = data[base + offsetx2];
+                        ori[2] = data[base + (offsetx2 << 1)];
+                        ori[3] = data[base + 3 * offsetx2];
+                        ori[4] = data[base + (offsetx2 << 2)];
+                        ori[5] = data[base + 5 * offsetx2];
+                        ori[6] = data[base + 6 * offsetx2];
+                        ori[7] = data[base + 7 * offsetx2];
+                        ori_avx = _mm256_loadu_ps(ori);
+                    }
                     __m256 quant_avx = _mm256_sub_ps(ori_avx, sum); // prediction error
+                    if constexpr (avx2_zero_code_enabled<SkipOverwrite>) {
+                        if (is_avx2_zero_code_batch(quant_avx, zero_bound)) {
+                            if constexpr (!SkipOverwrite) {
+                                const __m256 out = avx2_zero_code_reconstruct(quant_avx, sum, ebx2_avx);
+                                T tmp[8];
+                                _mm256_storeu_ps(tmp, out);
+                                if (avx2_stride2_stores_enabled && offset == 1) {
+                                    avx2_store_stride2(data + start, tmp);
+                                } else {
+                                    for (size_t j = 0; j < step; ++j) data[(start + (j << 1)) * offset] = tmp[j];
+                                }
+                            }
+                            store_quant8(local_quant_inds[tid] + local_quant_index[tid].value, _mm256_setzero_si256());
+                            local_quant_index[tid].value += step;
+                            continue;
+                        }
+                    }
                     float tmp[8];
                     quantize_1D_float(sum, ori_avx, quant_avx, tmp);
                     __m256i quant_avx_i = _mm256_cvtps_epi32(quant_avx);
                     if constexpr (!SkipOverwrite) {
-                        #pragma unroll
-                        for (size_t j = 0; j < step; ++j) {
-                            data[(start + (j << 1)) * offset] = tmp[j];
+                        if (avx2_stride2_stores_enabled && offset == 1) {
+                            avx2_store_stride2(data + start, tmp);
+                        } else {
+                            #pragma unroll
+                            for (size_t j = 0; j < step; ++j) {
+                                data[(start + (j << 1)) * offset] = tmp[j];
+                            }
                         }
                     }
                     unsigned esc = static_cast<unsigned>(_mm256_movemask_ps(_mm256_castsi256_ps(
                                        _mm256_cmpeq_epi32(quant_avx_i, _mm256_set1_epi32(-32768)))));
+                    if (esc && avx2_stride2_loads_enabled && offset == 1)
+                        _mm256_storeu_ps(ori, ori_avx);
                     while (esc) {
                         int k = __builtin_ctz(esc);
                         if constexpr (!SkipOverwrite) data[(start + (k << 1)) * offset] = ori[k];
@@ -426,9 +677,13 @@ namespace Falcons {
                     _mm256_storeu_ps(tmp, decompressed);
 
                     if constexpr (!SkipOverwrite) {
-                        #pragma unroll
-                        for (size_t j = 0; j < step; ++j) {
-                            data[(start + (j << 1)) * offset] = tmp[j];
+                        if (avx2_stride2_stores_enabled && offset == 1) {
+                            avx2_store_stride2(data + start, tmp);
+                        } else {
+                            #pragma unroll
+                            for (size_t j = 0; j < step; ++j) {
+                                data[(start + (j << 1)) * offset] = tmp[j];
+                            }
                         }
                     }
                     unsigned esc = static_cast<unsigned>(_mm256_movemask_ps(_mm256_castsi256_ps(
@@ -448,6 +703,8 @@ namespace Falcons {
         }
         else if constexpr (std::is_same_v<T, double>) {
             static constexpr size_t step = AVX_256_parallelism;
+            const __m256d zero_bound = avx2_zero_code_bound<CompMode == COMPMODE::COMP && avx2_zero_code_enabled<SkipOverwrite>>(
+                rel_eb_avx_d, nrel_eb_avx_d, real_ebx2, real_ebx2_r, radius, odd_len > step);
             const __m256d factor = _mm256_set1_pd(0.5);
 
             for (; i + step < odd_len; i += step) {
@@ -460,29 +717,55 @@ namespace Falcons {
                 size_t start = (i << 1) + 1;
                 if constexpr (CompMode == COMPMODE::COMP) {
                     T ori[4];
-                    size_t base = start * offset;
-                    size_t offsetx2 = offset << 1;
-
-                    ori[0] = data[base];
-                    ori[1] = data[base + offsetx2];
-                    ori[2] = data[base + (offsetx2 << 1)];
-                    ori[3] = data[base + 3 * offsetx2];
-
-                    __m256d ori_avx = _mm256_loadu_pd(ori);
+                    __m256d ori_avx;
+                    if (avx2_stride2_loads_enabled && offset == 1) {
+                        ori_avx = avx2_load_stride2(data + start);
+                    } else {
+                        size_t base = start * offset;
+                        size_t offsetx2 = offset << 1;
+                        ori[0] = data[base];
+                        ori[1] = data[base + offsetx2];
+                        ori[2] = data[base + (offsetx2 << 1)];
+                        ori[3] = data[base + 3 * offsetx2];
+                        ori_avx = _mm256_loadu_pd(ori);
+                    }
                     __m256d quant_avx = _mm256_sub_pd(ori_avx, sum); // prediction error
+                    if constexpr (avx2_zero_code_enabled<SkipOverwrite>) {
+                        if (is_avx2_zero_code_batch(quant_avx, zero_bound)) {
+                            if constexpr (!SkipOverwrite) {
+                                const __m256d out = avx2_zero_code_reconstruct(quant_avx, sum, ebx2_avx);
+                                T tmp[4];
+                                _mm256_storeu_pd(tmp, out);
+                                if (avx2_stride2_stores_enabled && offset == 1) {
+                                    avx2_store_stride2(data + start, tmp);
+                                } else {
+                                    for (size_t j = 0; j < step; ++j) data[(start + (j << 1)) * offset] = tmp[j];
+                                }
+                            }
+                            store_quant4(local_quant_inds[tid] + local_quant_index[tid].value, _mm_setzero_si128());
+                            local_quant_index[tid].value += step;
+                            continue;
+                        }
+                    }
                     T tmp[4];
                     quantize_1D_double(sum, ori_avx, quant_avx, tmp);
 
                     __m128i quant_avx_i = _mm256_cvtpd_epi32(quant_avx);
 
                     if constexpr (!SkipOverwrite) {
-                        #pragma unroll
-                        for (size_t j = 0; j < step; ++j) {
-                            data[(start + (j << 1)) * offset] = tmp[j];
+                        if (avx2_stride2_stores_enabled && offset == 1) {
+                            avx2_store_stride2(data + start, tmp);
+                        } else {
+                            #pragma unroll
+                            for (size_t j = 0; j < step; ++j) {
+                                data[(start + (j << 1)) * offset] = tmp[j];
+                            }
                         }
                     }
                     unsigned esc = static_cast<unsigned>(_mm_movemask_ps(_mm_castsi128_ps(
                                        _mm_cmpeq_epi32(quant_avx_i, _mm_set1_epi32(-32768)))));
+                    if (esc && avx2_stride2_loads_enabled && offset == 1)
+                        _mm256_storeu_pd(ori, ori_avx);
                     while (esc) {
                         int k = __builtin_ctz(esc);
                         if constexpr (!SkipOverwrite) data[(start + (k << 1)) * offset] = ori[k];
@@ -501,9 +784,13 @@ namespace Falcons {
                     _mm256_storeu_pd(tmp, decompressed);
 
                     if constexpr (!SkipOverwrite) {
-                        #pragma unroll
-                        for (size_t j = 0; j < step; ++j) {
-                            data[(start + (j << 1)) * offset] = tmp[j];
+                        if (avx2_stride2_stores_enabled && offset == 1) {
+                            avx2_store_stride2(data + start, tmp);
+                        } else {
+                            #pragma unroll
+                            for (size_t j = 0; j < step; ++j) {
+                                data[(start + (j << 1)) * offset] = tmp[j];
+                            }
                         }
                     }
                     unsigned esc = static_cast<unsigned>(_mm_movemask_ps(_mm_castsi128_ps(
@@ -554,6 +841,8 @@ namespace Falcons {
         size_t i = 0;
         if constexpr (std::is_same_v<T, float>) {
             static constexpr size_t step = AVX_256_parallelism;
+            const __m256 zero_bound = avx2_zero_code_bound<CompMode == COMPMODE::COMP && avx2_zero_code_enabled<SkipOverwrite>>(
+                rel_eb_avx_f, nrel_eb_avx_f, real_ebx2, real_ebx2_r, radius, even_len > step + 2);
             const __m256 nine  = _mm256_set1_ps(9.0f);
             const __m256 factor = _mm256_set1_ps(1.0f / 16.0f);
 
@@ -573,33 +862,58 @@ namespace Falcons {
 
                 if constexpr (CompMode == COMPMODE::COMP) {
                     T ori[8];
-                    size_t base = start * offset;
-                    size_t offsetx2 = offset << 1;
-
-                    ori[0] = data[base];
-                    ori[1] = data[base + offsetx2];
-                    ori[2] = data[base + (offsetx2 << 1)];
-                    ori[3] = data[base + 3 * offsetx2];
-                    ori[4] = data[base + (offsetx2 << 2)];
-                    ori[5] = data[base + 5 * offsetx2];
-                    ori[6] = data[base + 6 * offsetx2];
-                    ori[7] = data[base + 7 * offsetx2];
-
-
-                    __m256 ori_avx = _mm256_loadu_ps(ori);
+                    __m256 ori_avx;
+                    if (avx2_stride2_loads_enabled && offset == 1) {
+                        ori_avx = avx2_load_stride2(data + start);
+                    } else {
+                        size_t base = start * offset;
+                        size_t offsetx2 = offset << 1;
+                        ori[0] = data[base];
+                        ori[1] = data[base + offsetx2];
+                        ori[2] = data[base + (offsetx2 << 1)];
+                        ori[3] = data[base + 3 * offsetx2];
+                        ori[4] = data[base + (offsetx2 << 2)];
+                        ori[5] = data[base + 5 * offsetx2];
+                        ori[6] = data[base + 6 * offsetx2];
+                        ori[7] = data[base + 7 * offsetx2];
+                        ori_avx = _mm256_loadu_ps(ori);
+                    }
                     __m256 quant_avx = _mm256_sub_ps(ori_avx, sum); // prediction error
+                    if constexpr (avx2_zero_code_enabled<SkipOverwrite>) {
+                        if (is_avx2_zero_code_batch(quant_avx, zero_bound)) {
+                            if constexpr (!SkipOverwrite) {
+                                const __m256 out = avx2_zero_code_reconstruct(quant_avx, sum, ebx2_avx);
+                                T tmp[8];
+                                _mm256_storeu_ps(tmp, out);
+                                if (avx2_stride2_stores_enabled && offset == 1) {
+                                    avx2_store_stride2(data + start, tmp);
+                                } else {
+                                    for (size_t j = 0; j < step; ++j) data[(start + (j << 1)) * offset] = tmp[j];
+                                }
+                            }
+                            store_quant8(local_quant_inds[tid] + local_quant_index[tid].value, _mm256_setzero_si256());
+                            local_quant_index[tid].value += step;
+                            continue;
+                        }
+                    }
                     float tmp[8];
                     quantize_1D_float(sum, ori_avx, quant_avx, tmp);
 
                     __m256i quant_avx_i = _mm256_cvtps_epi32(quant_avx);
                     if constexpr (!SkipOverwrite) {
-                        #pragma unroll
-                        for (size_t j = 0; j < step; ++j) {
-                            data[(start + (j << 1)) * offset] = tmp[j];
+                        if (avx2_stride2_stores_enabled && offset == 1) {
+                            avx2_store_stride2(data + start, tmp);
+                        } else {
+                            #pragma unroll
+                            for (size_t j = 0; j < step; ++j) {
+                                data[(start + (j << 1)) * offset] = tmp[j];
+                            }
                         }
                     }
                     unsigned esc = static_cast<unsigned>(_mm256_movemask_ps(_mm256_castsi256_ps(
                                        _mm256_cmpeq_epi32(quant_avx_i, _mm256_set1_epi32(-32768)))));
+                    if (esc && avx2_stride2_loads_enabled && offset == 1)
+                        _mm256_storeu_ps(ori, ori_avx);
                     while (esc) {
                         int k = __builtin_ctz(esc);
                         if constexpr (!SkipOverwrite) data[(start + (k << 1)) * offset] = ori[k];
@@ -626,9 +940,13 @@ namespace Falcons {
                     _mm256_storeu_ps(tmp, decompressed);
 
                     if constexpr (!SkipOverwrite) {
-                        #pragma unroll
-                        for (size_t j = 0; j < step; ++j) {
-                            data[(start + (j << 1)) * offset] = tmp[j];
+                        if (avx2_stride2_stores_enabled && offset == 1) {
+                            avx2_store_stride2(data + start, tmp);
+                        } else {
+                            #pragma unroll
+                            for (size_t j = 0; j < step; ++j) {
+                                data[(start + (j << 1)) * offset] = tmp[j];
+                            }
                         }
                     }
                     unsigned esc = static_cast<unsigned>(_mm256_movemask_ps(_mm256_castsi256_ps(
@@ -649,6 +967,8 @@ namespace Falcons {
         }
         else if constexpr (std::is_same_v<T, double>) {
             static constexpr size_t step = AVX_256_parallelism;
+            const __m256d zero_bound = avx2_zero_code_bound<CompMode == COMPMODE::COMP && avx2_zero_code_enabled<SkipOverwrite>>(
+                rel_eb_avx_d, nrel_eb_avx_d, real_ebx2, real_ebx2_r, radius, even_len > step + 2);
             const __m256d nine  = _mm256_set1_pd(9.0);
             const __m256d factor = _mm256_set1_pd(1.0 / 16.0);
 
@@ -670,29 +990,55 @@ namespace Falcons {
 
                 if constexpr (CompMode == COMPMODE::COMP) {
                     T ori[4];
-                    size_t base = start * offset;
-                    size_t offsetx2 = offset << 1;
-
-                    ori[0] = data[base];
-                    ori[1] = data[base + offsetx2];
-                    ori[2] = data[base + (offsetx2 << 1)];
-                    ori[3] = data[base + 3 * offsetx2];
-
-                    __m256d ori_avx = _mm256_loadu_pd(ori);
+                    __m256d ori_avx;
+                    if (avx2_stride2_loads_enabled && offset == 1) {
+                        ori_avx = avx2_load_stride2(data + start);
+                    } else {
+                        size_t base = start * offset;
+                        size_t offsetx2 = offset << 1;
+                        ori[0] = data[base];
+                        ori[1] = data[base + offsetx2];
+                        ori[2] = data[base + (offsetx2 << 1)];
+                        ori[3] = data[base + 3 * offsetx2];
+                        ori_avx = _mm256_loadu_pd(ori);
+                    }
                     __m256d quant_avx = _mm256_sub_pd(ori_avx, sum); // prediction error
+                    if constexpr (avx2_zero_code_enabled<SkipOverwrite>) {
+                        if (is_avx2_zero_code_batch(quant_avx, zero_bound)) {
+                            if constexpr (!SkipOverwrite) {
+                                const __m256d out = avx2_zero_code_reconstruct(quant_avx, sum, ebx2_avx);
+                                T tmp[4];
+                                _mm256_storeu_pd(tmp, out);
+                                if (avx2_stride2_stores_enabled && offset == 1) {
+                                    avx2_store_stride2(data + start, tmp);
+                                } else {
+                                    for (size_t j = 0; j < step; ++j) data[(start + (j << 1)) * offset] = tmp[j];
+                                }
+                            }
+                            store_quant4(local_quant_inds[tid] + local_quant_index[tid].value, _mm_setzero_si128());
+                            local_quant_index[tid].value += step;
+                            continue;
+                        }
+                    }
                     T tmp[4];
                     quantize_1D_double(sum, ori_avx, quant_avx, tmp);
 
                     __m128i quant_avx_i = _mm256_cvtpd_epi32(quant_avx);
 
                     if constexpr (!SkipOverwrite) {
-                        #pragma unroll
-                        for (size_t j = 0; j < step; ++j) {
-                            data[(start + (j << 1)) * offset] = tmp[j];
+                        if (avx2_stride2_stores_enabled && offset == 1) {
+                            avx2_store_stride2(data + start, tmp);
+                        } else {
+                            #pragma unroll
+                            for (size_t j = 0; j < step; ++j) {
+                                data[(start + (j << 1)) * offset] = tmp[j];
+                            }
                         }
                     }
                     unsigned esc = static_cast<unsigned>(_mm_movemask_ps(_mm_castsi128_ps(
                                        _mm_cmpeq_epi32(quant_avx_i, _mm_set1_epi32(-32768)))));
+                    if (esc && avx2_stride2_loads_enabled && offset == 1)
+                        _mm256_storeu_pd(ori, ori_avx);
                     while (esc) {
                         int k = __builtin_ctz(esc);
                         if constexpr (!SkipOverwrite) data[(start + (k << 1)) * offset] = ori[k];
@@ -710,9 +1056,13 @@ namespace Falcons {
                     T tmp[4];
                     _mm256_storeu_pd(tmp, decompressed);
 
-                    #pragma unroll
-                    for (size_t j = 0; j < step; ++j) {
-                        data[(start + (j << 1)) * offset] = tmp[j];
+                    if (avx2_stride2_stores_enabled && offset == 1) {
+                        avx2_store_stride2(data + start, tmp);
+                    } else {
+                        #pragma unroll
+                        for (size_t j = 0; j < step; ++j) {
+                            data[(start + (j << 1)) * offset] = tmp[j];
+                        }
                     }
                     unsigned esc = static_cast<unsigned>(_mm_movemask_ps(_mm_castsi128_ps(
                                        _mm_cmpeq_epi32(quant_avx_i, _mm_set1_epi32(-32768)))));
@@ -766,6 +1116,8 @@ namespace Falcons {
 
         if constexpr (std::is_same_v<T, float>) {
             static constexpr size_t step = AVX_256_parallelism;
+            const __m256 zero_bound = avx2_zero_code_bound<CompMode == COMPMODE::COMP && avx2_zero_code_enabled<SkipOverwrite>>(
+                rel_eb_avx_f, nrel_eb_avx_f, real_ebx2, real_ebx2_r, radius, len >= step);
             const __m256 factor = _mm256_set1_ps(0.5f);
 
             for (; i + step <= len; i += step) {
@@ -776,7 +1128,7 @@ namespace Falcons {
                 sum = _mm256_mul_ps(sum, factor);
 
                 // _mm256_storeu_ps(p + i, sum);
-                quantize_float<CompMode, step, true, SkipOverwrite>(sum, i, data, offset, len, tid);
+                quantize_float<CompMode, step, true, SkipOverwrite>(sum, i, data, offset, len, tid, &zero_bound);
             }
             if (i < len) {
                 __m256 va = _mm256_loadu_ps(a + i);
@@ -791,6 +1143,8 @@ namespace Falcons {
         }
         else if constexpr (std::is_same_v<T, double>) {
             static constexpr size_t step = AVX_256_parallelism;
+            const __m256d zero_bound = avx2_zero_code_bound<CompMode == COMPMODE::COMP && avx2_zero_code_enabled<SkipOverwrite>>(
+                rel_eb_avx_d, nrel_eb_avx_d, real_ebx2, real_ebx2_r, radius, len >= step);
             const __m256d factor = _mm256_set1_pd(0.5);
 
             for (; i + step <= len; i += step) {
@@ -801,7 +1155,7 @@ namespace Falcons {
                 sum = _mm256_mul_pd(sum, factor);
                 // _mm256_storeu_pd(p + i, sum);
                 // size_t start = i;
-                quantize_double<CompMode, step, true, SkipOverwrite>(sum, i, data, offset, len, tid);
+                quantize_double<CompMode, step, true, SkipOverwrite>(sum, i, data, offset, len, tid, &zero_bound);
             }
             if (i < len) {
                 __m256d va = _mm256_loadu_pd(a + i);
@@ -826,6 +1180,8 @@ namespace Falcons {
 
         if constexpr (std::is_same_v<T, float>) {
             static constexpr size_t step = AVX_256_parallelism;
+            const __m256 zero_bound = avx2_zero_code_bound<CompMode == COMPMODE::COMP && avx2_zero_code_enabled<SkipOverwrite>>(
+                rel_eb_avx_f, nrel_eb_avx_f, real_ebx2, real_ebx2_r, radius, len >= step);
             const __m256 nine  = _mm256_set1_ps(9.0f);
             const __m256 factor = _mm256_set1_ps(1.0f / 16.0f);
 
@@ -842,7 +1198,7 @@ namespace Falcons {
                 sum = _mm256_mul_ps(sum, factor);
 
                 // _mm256_storeu_ps(p + i, sum);
-                quantize_float<CompMode, step, true, SkipOverwrite>(sum, i, data, offset, len, tid);
+                quantize_float<CompMode, step, true, SkipOverwrite>(sum, i, data, offset, len, tid, &zero_bound);
             }
             if (i < len) {
                 __m256 va = _mm256_loadu_ps(a + i);
@@ -863,6 +1219,8 @@ namespace Falcons {
         }
         else if constexpr (std::is_same_v<T, double>) {
             static constexpr size_t step = AVX_256_parallelism;
+            const __m256d zero_bound = avx2_zero_code_bound<CompMode == COMPMODE::COMP && avx2_zero_code_enabled<SkipOverwrite>>(
+                rel_eb_avx_d, nrel_eb_avx_d, real_ebx2, real_ebx2_r, radius, len >= step);
             const __m256d nine  = _mm256_set1_pd(9.0);
             const __m256d factor = _mm256_set1_pd(1.0 / 16.0);
 
@@ -879,7 +1237,7 @@ namespace Falcons {
 
                 sum = _mm256_mul_pd(sum, factor);
                 // _mm256_storeu_pd(p + i, sum);
-                quantize_double<CompMode, step, true, SkipOverwrite>(sum, i, data, offset, len, tid);
+                quantize_double<CompMode, step, true, SkipOverwrite>(sum, i, data, offset, len, tid, &zero_bound);
             }
             if (i < len) {
                 __m256d va = _mm256_loadu_pd(a + i);
@@ -909,10 +1267,12 @@ namespace Falcons {
 
         if constexpr (std::is_same_v<T, float>) {
             static constexpr size_t step = AVX_256_parallelism;
+            const __m256 zero_bound = avx2_zero_code_bound<CompMode == COMPMODE::COMP && avx2_zero_code_enabled<SkipOverwrite>>(
+                rel_eb_avx_f, nrel_eb_avx_f, real_ebx2, real_ebx2_r, radius, len >= step);
             for (; i + step <= len; i += step) {
                 __m256 sum = _mm256_loadu_ps(a + i);
                 // _mm256_storeu_ps(p + i, sum);
-                quantize_float<CompMode, step, true, SkipOverwrite>(sum, i, data, offset, len, tid);
+                quantize_float<CompMode, step, true, SkipOverwrite>(sum, i, data, offset, len, tid, &zero_bound);
             }
             if (i < len) {
                 __m256 sum = _mm256_loadu_ps(a + i);
@@ -923,9 +1283,11 @@ namespace Falcons {
         }
         else if constexpr (std::is_same_v<T, double>) {
             static constexpr size_t step = AVX_256_parallelism;
+            const __m256d zero_bound = avx2_zero_code_bound<CompMode == COMPMODE::COMP && avx2_zero_code_enabled<SkipOverwrite>>(
+                rel_eb_avx_d, nrel_eb_avx_d, real_ebx2, real_ebx2_r, radius, len >= step);
             for (; i + step <= len; i += step) {
                 __m256d sum = _mm256_loadu_pd(a + i);
-                quantize_double<CompMode, step, true, SkipOverwrite>(sum, i, data, offset, len, tid);
+                quantize_double<CompMode, step, true, SkipOverwrite>(sum, i, data, offset, len, tid, &zero_bound);
             }
             if (i < len) {
                 __m256d sum = _mm256_loadu_pd(a + i);
@@ -942,6 +1304,8 @@ namespace Falcons {
 
         if constexpr (std::is_same_v<T, float>) {
             static constexpr size_t step = AVX_256_parallelism;
+            const __m256 zero_bound = avx2_zero_code_bound<CompMode == COMPMODE::COMP && avx2_zero_code_enabled<SkipOverwrite>>(
+                rel_eb_avx_f, nrel_eb_avx_f, real_ebx2, real_ebx2_r, radius, len >= step);
             const __m256 half = _mm256_set1_ps(0.5f);
             const __m256 threehalf = _mm256_set1_ps(1.5f);
             for (; i + step <= len; i += step) {
@@ -949,7 +1313,7 @@ namespace Falcons {
                 __m256 va = _mm256_loadu_ps(a + i);
                 vb = _mm256_mul_ps(vb, threehalf);              // 1.5*b
                 __m256 sum = _mm256_fnmadd_ps(half, va, vb);    // 1.5*b - 0.5*a  (== interp_linear1, fused)
-                quantize_float<CompMode, step, true, SkipOverwrite>(sum, i, data, offset, len, tid);
+                quantize_float<CompMode, step, true, SkipOverwrite>(sum, i, data, offset, len, tid, &zero_bound);
             }
             if (i < len) {
                 __m256 vb = _mm256_loadu_ps(b + i);
@@ -961,6 +1325,8 @@ namespace Falcons {
         }
         else if constexpr (std::is_same_v<T, double>) {
             static constexpr size_t step = AVX_256_parallelism;
+            const __m256d zero_bound = avx2_zero_code_bound<CompMode == COMPMODE::COMP && avx2_zero_code_enabled<SkipOverwrite>>(
+                rel_eb_avx_d, nrel_eb_avx_d, real_ebx2, real_ebx2_r, radius, len >= step);
             const __m256d half = _mm256_set1_pd(0.5);
             const __m256d threehalf = _mm256_set1_pd(1.5);
             for (; i + step <= len; i += step) {
@@ -968,7 +1334,7 @@ namespace Falcons {
                 __m256d vb = _mm256_loadu_pd(b + i);
                 vb = _mm256_mul_pd(vb, threehalf);              // 1.5*b
                 __m256d sum = _mm256_fnmadd_pd(half, va, vb);   // 1.5*b - 0.5*a  (== interp_linear1, fused)
-                quantize_double<CompMode, step, true, SkipOverwrite>(sum, i, data, offset, len, tid);
+                quantize_double<CompMode, step, true, SkipOverwrite>(sum, i, data, offset, len, tid, &zero_bound);
             }
             if (i < len) {
                 __m256d va = _mm256_loadu_pd(a + i);
@@ -987,6 +1353,8 @@ namespace Falcons {
         size_t i = 0;
         if constexpr (std::is_same_v<T, float>) {
             static constexpr size_t step = AVX_256_parallelism;
+            const __m256 zero_bound = avx2_zero_code_bound<CompMode == COMPMODE::COMP && avx2_zero_code_enabled<SkipOverwrite>>(
+                rel_eb_avx_f, nrel_eb_avx_f, real_ebx2, real_ebx2_r, radius, len >= step);
             const __m256 factor = _mm256_set1_ps(0.125f);
             const __m256 six = _mm256_set1_ps(6.0f);
             const __m256 three = _mm256_set1_ps(3.0f);
@@ -998,7 +1366,7 @@ namespace Falcons {
                 vb = _mm256_fmsub_ps(vb, six, vc);           // 6*b - c
                 __m256 sum = _mm256_fmadd_ps(va, three, vb); // 3*a + (6b-c)  (fully fused)
                 sum = _mm256_mul_ps(sum, factor);            // *0.125
-                quantize_float<CompMode, step, true, SkipOverwrite>(sum, i, data, offset, len, tid);
+                quantize_float<CompMode, step, true, SkipOverwrite>(sum, i, data, offset, len, tid, &zero_bound);
             }
             if (i < len) {
                 __m256 va = _mm256_loadu_ps(a + i);
@@ -1012,6 +1380,8 @@ namespace Falcons {
         }
         else if constexpr (std::is_same_v<T, double>) {
             static constexpr size_t step = AVX_256_parallelism;
+            const __m256d zero_bound = avx2_zero_code_bound<CompMode == COMPMODE::COMP && avx2_zero_code_enabled<SkipOverwrite>>(
+                rel_eb_avx_d, nrel_eb_avx_d, real_ebx2, real_ebx2_r, radius, len >= step);
             const __m256d factor = _mm256_set1_pd(0.125);
             const __m256d six = _mm256_set1_pd(6.0);
             const __m256d three = _mm256_set1_pd(3.0);
@@ -1023,7 +1393,7 @@ namespace Falcons {
                 vb = _mm256_fmsub_pd(vb, six, vc);            // 6*b - c
                 __m256d sum = _mm256_fmadd_pd(va, three, vb); // 3*a + (6b-c)  (fully fused)
                 sum = _mm256_mul_pd(sum, factor);             // *0.125
-                quantize_double<CompMode, step, true, SkipOverwrite>(sum, i, data, offset, len, tid);
+                quantize_double<CompMode, step, true, SkipOverwrite>(sum, i, data, offset, len, tid, &zero_bound);
             }
             if (i < len) {
                 __m256d va = _mm256_loadu_pd(a + i);
@@ -1045,6 +1415,8 @@ namespace Falcons {
         size_t i = 0;
         if constexpr (std::is_same_v<T, float>) {
             static constexpr size_t step = AVX_256_parallelism;
+            const __m256 zero_bound = avx2_zero_code_bound<CompMode == COMPMODE::COMP && avx2_zero_code_enabled<SkipOverwrite>>(
+                rel_eb_avx_f, nrel_eb_avx_f, real_ebx2, real_ebx2_r, radius, len >= step);
             const __m256 factor = _mm256_set1_ps(0.125f);
             const __m256 six = _mm256_set1_ps(6.0f);
             const __m256 three = _mm256_set1_ps(3.0f);
@@ -1056,7 +1428,7 @@ namespace Falcons {
                 vb = _mm256_fmsub_ps(vb, six, va);           // 6*b - a
                 __m256 sum = _mm256_fmadd_ps(vc, three, vb); // 3*c + (6b-a)  (fully fused)
                 sum = _mm256_mul_ps(sum, factor);            // *0.125
-                quantize_float<CompMode, step, true, SkipOverwrite>(sum, i, data, offset, len, tid);
+                quantize_float<CompMode, step, true, SkipOverwrite>(sum, i, data, offset, len, tid, &zero_bound);
             }
             if (i < len) {
                 __m256 va = _mm256_loadu_ps(a + i);
@@ -1070,6 +1442,8 @@ namespace Falcons {
         }
         else if constexpr (std::is_same_v<T, double>) {
             static constexpr size_t step = AVX_256_parallelism;
+            const __m256d zero_bound = avx2_zero_code_bound<CompMode == COMPMODE::COMP && avx2_zero_code_enabled<SkipOverwrite>>(
+                rel_eb_avx_d, nrel_eb_avx_d, real_ebx2, real_ebx2_r, radius, len >= step);
             const __m256d factor = _mm256_set1_pd(0.125);
             const __m256d six = _mm256_set1_pd(6.0);
             const __m256d three = _mm256_set1_pd(3.0);
@@ -1081,7 +1455,7 @@ namespace Falcons {
                 vb = _mm256_fmsub_pd(vb, six, va);            // 6*b - a
                 __m256d sum = _mm256_fmadd_pd(vc, three, vb); // 3*c + (6b-a)  (fully fused)
                 sum = _mm256_mul_pd(sum, factor);             // *0.125
-                quantize_double<CompMode, step, true, SkipOverwrite>(sum, i, data, offset, len, tid);
+                quantize_double<CompMode, step, true, SkipOverwrite>(sum, i, data, offset, len, tid, &zero_bound);
             }
             if (i < len) {
                 __m256d vc = _mm256_loadu_pd(c + i);
@@ -1098,13 +1472,15 @@ namespace Falcons {
 
     template <class T, uint N, class QuantizerOMP>
     template <COMPMODE CompMode, int step, bool FullOnly, bool SkipOverwrite, typename U, typename>
-    ALWAYS_INLINE void InterpolationDecomposition_OMP<T, N, QuantizerOMP>::quantize_float (__m256& sum, size_t& start, T*& data, size_t& offset, size_t& len, int tid) {
+    ALWAYS_INLINE void InterpolationDecomposition_OMP<T, N, QuantizerOMP>::quantize_float (__m256& sum, size_t& start, T*& data, size_t& offset, size_t& len, int tid, const __m256* zero_bound) {
         if constexpr (CompMode == COMPMODE::COMP) {
             T ori[8];
             __m256 ori_avx;
             if constexpr (FullOnly) {
                 // caller guarantees a full chunk: straight read, skip the per-lane tail routing
                 if (offset == 1) ori_avx = _mm256_loadu_ps(data + start);
+                else if (avx2_stride2_loads_enabled && step == 8 && offset == 2)
+                    ori_avx = avx2_load_stride2(data + start * offset);
                 else { for (size_t j = 0; j < step; ++j) ori[j] = data[(start + j) * offset]; ori_avx = _mm256_loadu_ps(ori); }
             } else {
                 // tail: clamp past-end indices to the last valid element (avoid OOB read)
@@ -1115,6 +1491,27 @@ namespace Falcons {
                 ori_avx = _mm256_loadu_ps(ori);
             }
             __m256 quant_avx = _mm256_sub_ps(ori_avx, sum); // prediction error
+            if constexpr (avx2_zero_code_enabled<SkipOverwrite> && step == 8) {
+                if (zero_bound && (FullOnly || (start <= len && len - start >= step)) &&
+                    is_avx2_zero_code_batch(quant_avx, *zero_bound)) {
+                    if constexpr (!SkipOverwrite) {
+                        const __m256 out = avx2_zero_code_reconstruct(quant_avx, sum, ebx2_avx);
+                        if (offset == 1) _mm256_storeu_ps(data + start, out);
+                        else {
+                            T tmp[8];
+                            _mm256_storeu_ps(tmp, out);
+                            if (avx2_stride2_stores_enabled && step == 8 && offset == 2) {
+                                avx2_store_stride2(data + start * offset, tmp);
+                            } else {
+                                for (size_t j = 0; j < step; ++j) data[(start + j) * offset] = tmp[j];
+                            }
+                        }
+                    }
+                    store_quant8(local_quant_inds[tid] + local_quant_index[tid].value, _mm256_setzero_si256());
+                    local_quant_index[tid].value += step;
+                    return;
+                }
+            }
             // calculate quantization code
             __m256d quant_avx_low  = _mm256_cvtps_pd(_mm256_castps256_ps128(quant_avx));
             quant_avx_low  = _mm256_round_pd(_mm256_mul_pd(quant_avx_low,  ebx2_r_avx),  _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
@@ -1173,9 +1570,15 @@ namespace Falcons {
                     if (esc) _mm256_storeu_ps(ori, ori_avx);   // contiguous read left ori[] unfilled
                     while (esc) { int k = __builtin_ctz(esc); quantizer.save_unpred2(ori[k], tid); esc &= esc - 1; }
                 } else {
-                    #pragma unroll
-                    for (size_t j = 0; j < step; ++j) {
-                        if constexpr (!SkipOverwrite) data[(start + j) * offset] = tmp[j];
+                    if (esc && avx2_stride2_loads_enabled && step == 8 && offset == 2)
+                        _mm256_storeu_ps(ori, ori_avx);
+                    if (avx2_stride2_stores_enabled && step == 8 && offset == 2) {
+                        if constexpr (!SkipOverwrite) avx2_store_stride2(data + start * offset, tmp);
+                    } else {
+                        #pragma unroll
+                        for (size_t j = 0; j < step; ++j) {
+                            if constexpr (!SkipOverwrite) data[(start + j) * offset] = tmp[j];
+                        }
                     }
                     while (esc) {
                         int k = __builtin_ctz(esc);
@@ -1226,8 +1629,12 @@ namespace Falcons {
                     _mm256_storeu_ps(data + start, decompressed);
                     while (esc) { int k = __builtin_ctz(esc); data[start + k] = quantizer.recover_unpred2(tid); esc &= esc - 1; }
                 } else {
-                    #pragma unroll
-                    for (size_t j = 0; j < step; ++j) data[(start + j) * offset] = tmp[j];
+                    if (avx2_stride2_stores_enabled && step == 8 && offset == 2) {
+                        avx2_store_stride2(data + start * offset, tmp);
+                    } else {
+                        #pragma unroll
+                        for (size_t j = 0; j < step; ++j) data[(start + j) * offset] = tmp[j];
+                    }
                     while (esc) { int k = __builtin_ctz(esc); data[(start + k) * offset] = quantizer.recover_unpred2(tid); esc &= esc - 1; }
                 }
             } else {
@@ -1249,13 +1656,15 @@ namespace Falcons {
 
     template <class T, uint N, class QuantizerOMP>
     template <COMPMODE CompMode, int step, bool FullOnly, bool SkipOverwrite, typename U, typename>
-    ALWAYS_INLINE void InterpolationDecomposition_OMP<T, N, QuantizerOMP>::quantize_double (__m256d& sum, size_t& start, T*& data, size_t& offset, size_t& len, int tid) {
+    ALWAYS_INLINE void InterpolationDecomposition_OMP<T, N, QuantizerOMP>::quantize_double (__m256d& sum, size_t& start, T*& data, size_t& offset, size_t& len, int tid, const __m256d* zero_bound) {
         if constexpr (CompMode == COMPMODE::COMP) {
             T ori[4];
             __m256d ori_avx;
             if constexpr (FullOnly) {
                 // caller guarantees a full chunk: straight read, skip the per-lane tail routing
                 if (offset == 1) ori_avx = _mm256_loadu_pd(data + start);
+                else if (avx2_stride2_loads_enabled && step == 4 && offset == 2)
+                    ori_avx = avx2_load_stride2(data + start * offset);
                 else { for (size_t j = 0; j < step; ++j) ori[j] = data[(start + j) * offset]; ori_avx = _mm256_loadu_pd(ori); }
             } else {
                 // tail: clamp past-end indices to the last valid element (avoid OOB read)
@@ -1266,6 +1675,27 @@ namespace Falcons {
                 ori_avx = _mm256_loadu_pd(ori);
             }
             __m256d quant_avx = _mm256_sub_pd(ori_avx, sum); // prediction error
+            if constexpr (avx2_zero_code_enabled<SkipOverwrite> && step == 4) {
+                if (zero_bound && (FullOnly || (start <= len && len - start >= step)) &&
+                    is_avx2_zero_code_batch(quant_avx, *zero_bound)) {
+                    if constexpr (!SkipOverwrite) {
+                        const __m256d out = avx2_zero_code_reconstruct(quant_avx, sum, ebx2_avx);
+                        if (offset == 1) _mm256_storeu_pd(data + start, out);
+                        else {
+                            T tmp[4];
+                            _mm256_storeu_pd(tmp, out);
+                            if (avx2_stride2_stores_enabled && step == 4 && offset == 2) {
+                                avx2_store_stride2(data + start * offset, tmp);
+                            } else {
+                                for (size_t j = 0; j < step; ++j) data[(start + j) * offset] = tmp[j];
+                            }
+                        }
+                    }
+                    store_quant4(local_quant_inds[tid] + local_quant_index[tid].value, _mm_setzero_si128());
+                    local_quant_index[tid].value += step;
+                    return;
+                }
+            }
             quant_avx = _mm256_round_pd(_mm256_mul_pd(quant_avx,  ebx2_r_avx),  _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
 
             __m256d mask = _mm256_and_pd(
@@ -1302,9 +1732,15 @@ namespace Falcons {
                     if (esc) _mm256_storeu_pd(ori, ori_avx);   // contiguous read left ori[] unfilled
                     while (esc) { int k = __builtin_ctz(esc); quantizer.save_unpred2(ori[k], tid); esc &= esc - 1; }
                 } else {
-                    #pragma unroll
-                    for (size_t j = 0; j < step; ++j) {
-                        if constexpr (!SkipOverwrite) data[(start + j) * offset] = tmp[j];
+                    if (esc && avx2_stride2_loads_enabled && step == 4 && offset == 2)
+                        _mm256_storeu_pd(ori, ori_avx);
+                    if (avx2_stride2_stores_enabled && step == 4 && offset == 2) {
+                        if constexpr (!SkipOverwrite) avx2_store_stride2(data + start * offset, tmp);
+                    } else {
+                        #pragma unroll
+                        for (size_t j = 0; j < step; ++j) {
+                            if constexpr (!SkipOverwrite) data[(start + j) * offset] = tmp[j];
+                        }
                     }
                     while (esc) {
                         int k = __builtin_ctz(esc);
@@ -1348,8 +1784,12 @@ namespace Falcons {
                     _mm256_storeu_pd(data + start, decompressed);
                     while (esc) { int k = __builtin_ctz(esc); data[start + k] = quantizer.recover_unpred2(tid); esc &= esc - 1; }
                 } else {
-                    #pragma unroll
-                    for (size_t j = 0; j < step; ++j) data[(start + j) * offset] = tmp[j];
+                    if (avx2_stride2_stores_enabled && step == 4 && offset == 2) {
+                        avx2_store_stride2(data + start * offset, tmp);
+                    } else {
+                        #pragma unroll
+                        for (size_t j = 0; j < step; ++j) data[(start + j) * offset] = tmp[j];
+                    }
                     while (esc) { int k = __builtin_ctz(esc); data[(start + k) * offset] = quantizer.recover_unpred2(tid); esc &= esc - 1; }
                 }
             } else {

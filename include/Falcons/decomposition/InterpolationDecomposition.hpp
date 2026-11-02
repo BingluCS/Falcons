@@ -9,6 +9,7 @@
 #ifndef Falcons_INTERPOLATION_DECOMPOSITION_HPP
 #define Falcons_INTERPOLATION_DECOMPOSITION_HPP
 
+#include <algorithm>
 #include <cmath>
 
 #if defined(__linux__)
@@ -23,9 +24,19 @@
 #include "Falcons/utils/Config.hpp"
 #include "Falcons/utils/FileUtil.hpp"
 #include "Falcons/utils/Interpolators.hpp"
+#include "Falcons/utils/InterpolationPacking.hpp"
+#include "Falcons/utils/TuningLinearSimd.hpp"
 #include "Falcons/utils/Iterator.hpp"
 #include "Falcons/utils/MemoryUtil.hpp"
 #include "Falcons/utils/BlockwiseIterator.hpp"
+
+// Retain c94a's final serial-decompression defaults; opt in explicitly to alternatives.
+#ifndef Falcons_SERIAL_DECOMP_ORIGINAL_STORES
+#define Falcons_SERIAL_DECOMP_ORIGINAL_STORES 1
+#endif
+#ifndef Falcons_SERIAL_DECOMP_ORIGINAL_PACKING
+#define Falcons_SERIAL_DECOMP_ORIGINAL_PACKING 1
+#endif
 
 #ifdef __AVX2__
 #include <immintrin.h>
@@ -46,6 +57,10 @@ class InterpolationDecomposition : public concepts::DecompositionInterface<T, in
 
 
     T *decompress(const Config &conf, int16_t* quant_inds_vec, T *dec_data) override {
+        if (!dec_data || conf.dims.size() != N ||
+            !std::equal(original_dimensions.begin(), original_dimensions.end(), conf.dims.begin())) {
+            throw std::invalid_argument("Interpolation dimensions do not match the output buffer");
+        }
         init();
         if constexpr (N != 1) {
 #ifdef __ARM_FEATURE_SVE2
@@ -129,6 +144,9 @@ class InterpolationDecomposition : public concepts::DecompositionInterface<T, in
 
     // compress given the error bound
     std::tuple<int16_t*, uint64_t> compress(const Config &conf, T *data) override {
+        if (!data || conf.dims.size() != N) {
+            throw std::invalid_argument("Invalid interpolation input dimensions or buffer");
+        }
         std::copy_n(conf.dims.begin(), N, original_dimensions.begin());
 
         interp_id = conf.interpAlgo;
@@ -250,6 +268,16 @@ class InterpolationDecomposition : public concepts::DecompositionInterface<T, in
 
         quantizer.save(c);
     }
+
+    size_t size_est() override {
+        if constexpr (std::is_same_v<Quantizer, LinearQuantizer<T>>) {
+            return N * sizeof(size_t) + sizeof(blocksize) + sizeof(interp_id) +
+                   sizeof(direction_sequence_id) + sizeof(anchor_stride) +
+                   sizeof(eb_alpha) + sizeof(eb_beta) + sizeof(uchar) +
+                   sizeof(double) + 2 * sizeof(int) + quantizer.size_est();
+        }
+        return 0;
+    }
     std::vector<T>& test_unpred() {
         return quantizer.test_unpred();
     }
@@ -336,6 +364,15 @@ class InterpolationDecomposition : public concepts::DecompositionInterface<T, in
         do {
             dim_sequences.push_back(sequence);
         } while (std::next_permutation(sequence.begin(), sequence.end()));
+        if (interp_id < 0 || static_cast<size_t>(interp_id) >= interpolators.size()) {
+            throw std::invalid_argument("Invalid interpolation algorithm");
+        }
+        if constexpr (N > 1) {
+            if (direction_sequence_id < 0 ||
+                static_cast<size_t>(direction_sequence_id) >= dim_sequences.size()) {
+                throw std::invalid_argument("Invalid interpolation direction");
+            }
+        }
     }
 
     void build_anchor_grid(T *data) {  // store anchor points. steplength: anchor_stride on each dimension
@@ -370,7 +407,56 @@ class InterpolationDecomposition : public concepts::DecompositionInterface<T, in
      * @param quantize_func
      * @return
      */
-    template <class QuantizeFunc>
+    #if Falcons_TUNING_SIMD_AVAILABLE
+    template <COMPMODE Mode>
+    static constexpr bool tuning_simd_candidate = Tuning == TUNING::ENABLED && Mode == COMPMODE::COMP &&
+        (std::is_same_v<T, float> || std::is_same_v<T, double>) &&
+        std::is_same_v<Quantizer, LinearQuantizer<T>>;
+
+    tuning_linear_detail::Parameters tuning_simd_parameters() const {
+        auto [eb, step, reciprocal] = quantizer.get_all_eb();
+        return {eb, step, reciprocal, quantizer.get_out_range().second / 2};
+    }
+
+    template <bool Cubic = false, class QuantizeFunc>
+    size_t tuning_simd_prefix(T *base, T *line, size_t count, size_t point_stride,
+                             size_t neighbor_stride, const tuning_linear_detail::Parameters &p,
+                             QuantizeFunc &&quantize_func) {
+        size_t i = 0;
+        for (; count - i >= 4; i += 4) {
+            T *d = line + i * point_stride;
+            tuning_linear_detail::Result<T> result;
+            const bool processed = Cubic
+                ? tuning_linear_detail::cubic4(d, point_stride, neighbor_stride, p, result)
+                : tuning_linear_detail::linear4(d, point_stride, neighbor_stride, p, result);
+            if (processed) {
+                for (size_t lane = 0; lane < 4; ++lane) {
+                    T &value = d[lane * point_stride];
+                    if (result.accepted & (1u << lane)) {
+                        value = result.reconstructed[lane];
+                        quant_inds[quant_index++] = result.codes[lane];
+                    } else {
+                        quant_inds[quant_index++] = quantizer.force_save_unpred(value);
+                    }
+                }
+            } else {
+                for (size_t lane = 0; lane < 4; ++lane) {
+                    T *point = d + lane * point_stride;
+                    if constexpr (Cubic)
+                        quantize_func(point - base, *point,
+                                      interp_cubic(*(point - 3 * neighbor_stride), *(point - neighbor_stride),
+                                                   *(point + neighbor_stride), *(point + 3 * neighbor_stride)));
+                    else
+                        quantize_func(point - base, *point,
+                                      interp_linear(*(point - neighbor_stride), *(point + neighbor_stride)));
+                }
+            }
+        }
+        return i;
+    }
+    #endif
+
+    template <COMPMODE Mode, class QuantizeFunc>
     double interpolation_1d(T *data, size_t begin, size_t end, size_t stride, const std::string &interp_func,
                             QuantizeFunc &&quantize_func) {
         size_t n = (end - begin) / stride + 1;
@@ -383,7 +469,19 @@ class InterpolationDecomposition : public concepts::DecompositionInterface<T, in
         size_t stride5x = 5 * stride;
         if (interp_func == "linear" || n < 5) {
             // if (pb == PB_predict_overwrite) {
-            for (size_t i = 1; i + 1 < n; i += 2) {
+            size_t i = 1;
+            #if Falcons_TUNING_LINEAR_AVAILABLE
+            if constexpr (tuning_simd_candidate<Mode>) {
+                const size_t count = (n - 1) / 2;
+                if (count >= 4) {
+                    const auto p = tuning_simd_parameters();
+                    if (p.eligible())
+                        i += 2 * tuning_simd_prefix(data, data + begin + stride, count, 2 * stride,
+                                                   stride, p, quantize_func);
+                }
+            }
+            #endif
+            for (; i + 1 < n; i += 2) {
                 T *d = data + begin + i * stride;
                 quantize_func(d - data, *d, interp_linear(*(d - stride), *(d + stride)));
             }
@@ -398,8 +496,19 @@ class InterpolationDecomposition : public concepts::DecompositionInterface<T, in
             // }
         } else {
             T *d;
-            size_t i;
-            for (i = 3; i + 3 < n; i += 2) {
+            size_t i = 3;
+            #if Falcons_TUNING_CUBIC_AVAILABLE
+            if constexpr (tuning_simd_candidate<Mode>) {
+                const size_t count = (n - 5) / 2;
+                if (count >= 4) {
+                    const auto p = tuning_simd_parameters();
+                    if (p.eligible())
+                        i += 2 * tuning_simd_prefix<true>(data, data + begin + stride3x, count, 2 * stride,
+                                                         stride, p, quantize_func);
+                }
+            }
+            #endif
+            for (; i + 3 < n; i += 2) {
                 d = data + begin + i * stride;
                 quantize_func(d - data, *d,
                               interp_cubic(*(d - stride3x), *(d - stride), *(d + stride), *(d + stride3x)));
@@ -432,7 +541,7 @@ class InterpolationDecomposition : public concepts::DecompositionInterface<T, in
      * @param quantize_func
      * @return
      */
-    template <class QuantizeFunc>
+    template <COMPMODE Mode, class QuantizeFunc>
     double interpolation_1d_fastest_dim_first(T *data, const std::array<size_t, N> &begin_idx,
                                               const std::array<size_t, N> &end_idx, const size_t &direction,
                                               std::array<size_t, N> &strides, const size_t &math_stride,
@@ -461,7 +570,33 @@ class InterpolationDecomposition : public concepts::DecompositionInterface<T, in
             begins[direction] = 1;
             ends[direction] = n - 1;
             strides[direction] = 2;
-            foreach
+            bool batched = false;
+            #if Falcons_TUNING_LINEAR_AVAILABLE
+            if constexpr (tuning_simd_candidate<Mode>) {
+                const size_t last = N - 1;
+                const size_t count = begins[last] < ends[last]
+                    ? 1 + (ends[last] - begins[last] - 1) / strides[last] : 0;
+                if (count >= 4) {
+                    const auto p = tuning_simd_parameters();
+                    if (p.eligible()) {
+                        auto row_ends = ends;
+                        row_ends[last] = begins[last] + 1;
+                        const size_t point_stride = strides[last] * dim_offsets[last];
+                        // Keep foreach's outer order, batching only its innermost row.
+                        foreach<T, N>(data, offset, begins, row_ends, strides, dim_offsets, [&](T *line) {
+                            const size_t done = tuning_simd_prefix(data, line, count, point_stride,
+                                                                  stride, p, quantize_func);
+                            for (size_t k = done; k < count; ++k) {
+                                T *d = line + k * point_stride;
+                                quantize_func(d - data, *d, interp_linear(*(d - stride), *(d + stride)));
+                            }
+                        });
+                        batched = true;
+                    }
+                }
+            }
+            #endif
+            if (!batched) foreach
                 <T, N>(data, offset, begins, ends, strides, dim_offsets,
                        [&](T *d) { quantize_func(d - data, *d, interp_linear(*(d - stride), *(d + stride))); });
             if (n % 2 == 0) {
@@ -481,7 +616,34 @@ class InterpolationDecomposition : public concepts::DecompositionInterface<T, in
             begins[direction] = i_start;
             ends[direction] = (n >= 3) ? (n - 3) : 0;
             strides[direction] = 2;
-            foreach
+            bool batched = false;
+            #if Falcons_TUNING_CUBIC_AVAILABLE
+            if constexpr (tuning_simd_candidate<Mode>) {
+                const size_t last = N - 1;
+                const size_t count = begins[last] < ends[last]
+                    ? 1 + (ends[last] - begins[last] - 1) / strides[last] : 0;
+                if (count >= 4) {
+                    const auto p = tuning_simd_parameters();
+                    if (p.eligible()) {
+                        auto row_ends = ends;
+                        row_ends[last] = begins[last] + 1;
+                        const size_t point_stride = strides[last] * dim_offsets[last];
+                        foreach<T, N>(data, offset, begins, row_ends, strides, dim_offsets, [&](T *line) {
+                            const size_t done = tuning_simd_prefix<true>(data, line, count, point_stride,
+                                                                        stride, p, quantize_func);
+                            for (size_t k = done; k < count; ++k) {
+                                T *d = line + k * point_stride;
+                                quantize_func(d - data, *d,
+                                              interp_cubic(*(d - stride3x), *(d - stride),
+                                                           *(d + stride), *(d + stride3x)));
+                            }
+                        });
+                        batched = true;
+                    }
+                }
+            }
+            #endif
+            if (!batched) foreach
                 <T, N>(data, offset, begins, ends, strides, dim_offsets, [&](T *d) {
                     quantize_func(d - data, *d,
                                   interp_cubic(*(d - stride3x), *(d - stride), *(d + stride), *(d + stride3x)));
@@ -575,10 +737,10 @@ class InterpolationDecomposition : public concepts::DecompositionInterface<T, in
     ALWAYS_INLINE void quantize_1D_double (__m256d& sum, __m256d& ori_avx, __m256d& quant_avx, T tmp[4]);
 
     template <COMPMODE CompMode, int step, bool FullOnly = false, bool SkipOverwrite = false, typename U = T, typename = std::enable_if_t<std::is_same_v<U, float>>>
-    ALWAYS_INLINE void quantize_float (__m256& sum, size_t& start, T*& data, size_t& offset, size_t& len);
+    ALWAYS_INLINE void quantize_float (__m256& sum, size_t& start, T*& data, size_t& offset, size_t& len, const __m256* zero_bound = nullptr);
 
     template <COMPMODE CompMode, int step, bool FullOnly = false, bool SkipOverwrite = false, typename U = T, typename = std::enable_if_t<std::is_same_v<U, double>>>
-    ALWAYS_INLINE void quantize_double (__m256d& sum, size_t& start, T*& data, size_t& offset, size_t& len);
+    ALWAYS_INLINE void quantize_double (__m256d& sum, size_t& start, T*& data, size_t& offset, size_t& len, const __m256d* zero_bound = nullptr);
 
 #endif
 #ifdef __ARM_FEATURE_SVE2
@@ -908,7 +1070,18 @@ class InterpolationDecomposition : public concepts::DecompositionInterface<T, in
                         cur_buffer_1 = cur_buffer_2;
                         cur_buffer_2 = temp_buffer;
                         buffer_idx = 0;
-                        for (size_t k = begins[2]; k < ends[2]; k += strides[2]) {
+#if Falcons_SERIAL_DECOMP_ORIGINAL_PACKING
+                        if constexpr (CompMode == COMPMODE::DECOMP) {
+                            for (size_t k = begins[2]; k < ends[2]; k += strides[2]) {
+                                auto cur_offset = cur_ij_offset + stride + k;
+                                cur_buffer_2[buffer_idx++] = data[cur_offset];
+                            }
+                        } else
+#endif
+                        if (packing_detail::use_yz<T>(strides[2], vector_len)) {
+                            packing_detail::copy_stride2(cur_buffer_2,
+                                data + cur_ij_offset + stride + begins[2], vector_len);
+                        } else for (size_t k = begins[2]; k < ends[2]; k += strides[2]) {
                             auto cur_offset =  cur_ij_offset + stride + k;
                             cur_buffer_2[buffer_idx++] = data[cur_offset];
                         }
@@ -1046,7 +1219,18 @@ class InterpolationDecomposition : public concepts::DecompositionInterface<T, in
                         cur_buffer_3 = cur_buffer_4;
                         cur_buffer_4 = temp_buffer;
                         size_t buffer_idx = 0;
-                        for (size_t k = begins[2]; k < ends[2]; k += strides[2]) {
+#if Falcons_SERIAL_DECOMP_ORIGINAL_PACKING
+                        if constexpr (CompMode == COMPMODE::DECOMP) {
+                            for (size_t k = begins[2]; k < ends[2]; k += strides[2]) {
+                                auto cur_offset = cur_ij_offset + stride3x + k;
+                                cur_buffer_4[buffer_idx++] = data[cur_offset];
+                            }
+                        } else
+#endif
+                        if (packing_detail::use_yz<T>(strides[2], vector_len)) {
+                            packing_detail::copy_stride2(cur_buffer_4,
+                                data + cur_ij_offset + stride3x + begins[2], vector_len);
+                        } else for (size_t k = begins[2]; k < ends[2]; k += strides[2]) {
                             auto cur_offset =  cur_ij_offset + stride3x + k;
                            cur_buffer_4[buffer_idx++] = data[cur_offset];
                         }
@@ -1194,7 +1378,18 @@ class InterpolationDecomposition : public concepts::DecompositionInterface<T, in
                         cur_buffer_2 = temp_buffer;
 
                         buffer_idx = 0;
-                        for (size_t k = begins[2]; k < ends[2]; k += strides[2]) {
+#if Falcons_SERIAL_DECOMP_ORIGINAL_PACKING
+                        if constexpr (CompMode == COMPMODE::DECOMP) {
+                            for (size_t k = begins[2]; k < ends[2]; k += strides[2]) {
+                                auto cur_offset = cur_ij_offset + stride + k;
+                                cur_buffer_2[buffer_idx++] = data[cur_offset];
+                            }
+                        } else
+#endif
+                        if (packing_detail::use_yz<T>(strides[2], vector_len)) {
+                            packing_detail::copy_stride2(cur_buffer_2,
+                                data + cur_ij_offset + stride + begins[2], vector_len);
+                        } else for (size_t k = begins[2]; k < ends[2]; k += strides[2]) {
                             auto cur_offset =  cur_ij_offset + stride + k;
                            // if (visited[cur_offset]==0 )
                             //   std::cout<<"e2 "<<i<<" "<<j<<" "<<k<<" "<<cur_offset<<std::endl;
@@ -1294,7 +1489,18 @@ class InterpolationDecomposition : public concepts::DecompositionInterface<T, in
                         cur_buffer_4 = temp_buffer;
 
                         buffer_idx = 0;
-                        for (size_t k = begins[2]; k < ends[2]; k += strides[2]) {
+#if Falcons_SERIAL_DECOMP_ORIGINAL_PACKING
+                        if constexpr (CompMode == COMPMODE::DECOMP) {
+                            for (size_t k = begins[2]; k < ends[2]; k += strides[2]) {
+                                auto cur_offset = cur_ij_offset + stride3x + k;
+                                cur_buffer_4[buffer_idx++] = data[cur_offset];
+                            }
+                        } else
+#endif
+                        if (packing_detail::use_yz<T>(strides[2], vector_len)) {
+                            packing_detail::copy_stride2(cur_buffer_4,
+                                data + cur_ij_offset + stride3x + begins[2], vector_len);
+                        } else for (size_t k = begins[2]; k < ends[2]; k += strides[2]) {
                             auto cur_offset =  cur_ij_offset + stride3x + k;
                            // if (visited[cur_offset]==0 )
                             //   std::cout<<"e2 "<<i<<" "<<j<<" "<<k<<" "<<cur_offset<<std::endl;
@@ -2313,7 +2519,7 @@ class InterpolationDecomposition : public concepts::DecompositionInterface<T, in
 
         if constexpr (N == 1) {  // mirror the N==2 structure below
             if constexpr (std::is_integral_v<T>) {
-                return interpolation_1d(data, begin[0], end[0], stride, interp_func, quantize_func);
+                return interpolation_1d<CompMode>(data, begin[0], end[0], stride, interp_func, quantize_func);
             } else if constexpr (Tuning == TUNING::DISABLED) {
                 // Floating builds go through the SIMD 1D path (interpolation_1d_simd ->
                 // interp_*_and_quantize_1D_line, with scalar/AVX2/SVE2 variants). This is
@@ -2321,7 +2527,7 @@ class InterpolationDecomposition : public concepts::DecompositionInterface<T, in
                 // from it at boundaries (different edge prediction).
                 return interpolation_1d_simd<CompMode, SkipOverwrite>(data, begin[0], end[0], stride, interp_func, quantize_func);
             } else {  // single-thread tuning keeps the legacy API (as N==2 does)
-                return interpolation_1d(data, begin[0], end[0], stride, interp_func, quantize_func);
+                return interpolation_1d<CompMode>(data, begin[0], end[0], stride, interp_func, quantize_func);
             }
         } else if constexpr (N == 2) {  // old API
             double predict_error = 0;
@@ -2374,14 +2580,14 @@ class InterpolationDecomposition : public concepts::DecompositionInterface<T, in
                 for (size_t j = (begin[dims[1]] ? begin[dims[1]] + stride2x : 0); j <= end[dims[1]]; j += stride2x) {
                     size_t begin_offset =
                         begin[dims[0]] * original_dim_offsets[dims[0]] + j * original_dim_offsets[dims[1]];
-                    predict_error += interpolation_1d(
+                    predict_error += interpolation_1d<CompMode>(
                         data, begin_offset, begin_offset + (end[dims[0]] - begin[dims[0]]) * original_dim_offsets[dims[0]],
                         stride * original_dim_offsets[dims[0]], interp_func, quantize_func);
                 }
                 for (size_t i = (begin[dims[0]] ? begin[dims[0]] + stride : 0); i <= end[dims[0]]; i += stride) {
                     size_t begin_offset =
                         i * original_dim_offsets[dims[0]] + begin[dims[1]] * original_dim_offsets[dims[1]];
-                    predict_error += interpolation_1d(
+                    predict_error += interpolation_1d<CompMode>(
                         data, begin_offset, begin_offset + (end[dims[1]] - begin[dims[1]]) * original_dim_offsets[dims[1]],
                         stride * original_dim_offsets[dims[1]], interp_func, quantize_func);
                 }
@@ -2400,7 +2606,24 @@ class InterpolationDecomposition : public concepts::DecompositionInterface<T, in
                 strides[dims[i]] = stride2x;
             }
 
+            auto interpolate_generic = [&]() {
+                predict_error += interpolation_1d_fastest_dim_first<CompMode>(
+                    data, begin_idx, end_idx, dims[0], strides, stride, interp_func, quantize_func);
+                for (uint i = 1; i < N; i++) {
+                    begin_idx[dims[i]] = begin[dims[i]];
+                    begin_idx[dims[i - 1]] = (begin[dims[i - 1]] ? begin[dims[i - 1]] + stride : 0);
+                    strides[dims[i - 1]] = stride;
+                    predict_error += interpolation_1d_fastest_dim_first<CompMode>(
+                        data, begin_idx, end_idx, dims[i], strides, stride, interp_func, quantize_func);
+                }
+            };
+
             if constexpr (Tuning == TUNING::DISABLED && N == 3 && !std::is_integral_v<T>) {//avx &&stride<=2
+                // The specialized x/y/z schedules only implement {0,1,2} and {2,1,0}.
+                if (direction != 0 && direction != 5) {
+                    interpolate_generic();
+                    return predict_error;
+                }
                 constexpr bool _fuse = false;      // x+y cache fusion, always on (set false to use the old path below)
                 constexpr size_t _fuse_tile = 1;     // z-slab thickness (planes); 1 is optimal
                 if(direction ==0 ){//xyz
@@ -2509,14 +2732,7 @@ class InterpolationDecomposition : public concepts::DecompositionInterface<T, in
                 }
             }
             else{
-                predict_error += interpolation_1d_fastest_dim_first(data, begin_idx, end_idx, dims[0], strides, stride, interp_func, quantize_func);
-                for (uint i = 1; i < N; i++) {
-                begin_idx[dims[i]] = begin[dims[i]];
-                begin_idx[dims[i - 1]] = (begin[dims[i - 1]] ? begin[dims[i - 1]] + stride : 0);
-                strides[dims[i - 1]] = stride;
-
-                predict_error += interpolation_1d_fastest_dim_first(data, begin_idx, end_idx, dims[i], strides, stride, interp_func, quantize_func);
-                }
+                interpolate_generic();
             }
 
 
