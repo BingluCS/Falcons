@@ -75,3 +75,20 @@ max_err, psnr, nrmse    = falcons.verify(data, decompressed.reshape(data.shape))
 * Add `-DENABLE_AVX2=ON` to vectorize the compression that runs *inside* the filter — the filter's CMake sets the SIMD flags explicitly, so it is AVX2/SVE2-accelerated just like the rest of Falcons.
 * `falconsToHDF5` and `HDF5ToFalcons` (under `tools/H5Z-Falcons/test`) are provided for testing — e.g. `falconsToHDF5 -f data.dat 100 100 100` writes `data.dat.falcons.h5`, and `HDF5ToFalcons data.dat.falcons.h5` reconstructs it. The type flag is `-f` (float), `-d` (double), or `-i8/-u8/-i16/-u16/-i32/-u32/-i64/-u64` for integers.
 * To use it as a dynamically-loaded HDF5 filter, point `HDF5_PLUGIN_PATH` at the built `libhdf5falcons`, then request filter id `40024` on your dataset-creation property list.
+
+## Citation
+
+If you use Falcons in your research, please cite:
+
+```bibtex
+@inproceedings{falcons2027,
+  title     = {Falcons: Pushing the Speed-Ratio Limits of Lossy Compression for Parallel Scientific Applications},
+  author    = {Bing Lu, Jinyang Liu, Xinyang Ma, Quantong Fu, Chenwei Hou, Zedong Liu, Wenjing Huang, Yida Gu, Xingchen Liu, Zheng Wei, Anbang Wu, Xiaofeng Hou, Chao Li, Guangming Tan, Minyi Guo, Dingwen Tao},
+  booktitle = {Proceedings of the 32nd ACM SIGPLAN Annual Symposium on Principles and Practice of Parallel Programming (PPoPP '27)},
+  year      = {2027},
+  note      = {arXiv:2610.41209},
+  url       = {https://arxiv.org/abs/2610.41209}
+}
+```
+
+Paper: [arXiv:2610.41209](https://arxiv.org/abs/2610.41209)
