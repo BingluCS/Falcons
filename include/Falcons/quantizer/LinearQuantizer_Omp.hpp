@@ -12,6 +12,7 @@
 #include <omp.h>
 #endif
 #include <cassert>
+#include <cmath>
 #include <cstring>
 #include <iostream>
 #include <memory>
@@ -44,6 +45,15 @@ class LinearQuantizerOMP : public concepts::QuantizerOMPInterface<T, int> {
 
     double get_eb() const { return error_bound; }
 
+    ALWAYS_INLINE T dequantize(T pred, int quant_index) const {
+        if constexpr (std::is_same_v<T, float> || std::is_same_v<T, double>) {
+            return static_cast<T>(std::fma(static_cast<double>(quant_index), double_error_bound,
+                                           static_cast<double>(pred)));
+        } else {
+            return pred + quant_index * double_error_bound;
+        }
+    }
+
     ALWAYS_INLINE std::tuple<double, double, double> get_all_eb() const { return {error_bound, double_error_bound, double_error_bound_reciprocal}; }
 
     void set_eb(double eb) {
@@ -64,7 +74,7 @@ class LinearQuantizerOMP : public concepts::QuantizerOMPInterface<T, int> {
             //if (diff < 0)
             //    quant_index = -quant_index;
             //auto quant_index_shifted = this->radius + quant_index;
-            T decompressed_data = pred + quant_index * this->double_error_bound;
+            T decompressed_data = dequantize(pred, quant_index);
             // if data is NaN, the error is NaN, and NaN <= error_bound is false
             T err = decompressed_data - data;
             if (err >= -this->error_bound && err <= this->error_bound) {
@@ -88,7 +98,7 @@ class LinearQuantizerOMP : public concepts::QuantizerOMPInterface<T, int> {
             //if (diff < 0)
             //    quant_index = -quant_index;
             //auto quant_index_shifted = this->radius + quant_index;
-            T decompressed_data = pred + quant_index * this->double_error_bound;
+            T decompressed_data = dequantize(pred, quant_index);
             // if data is NaN, the error is NaN, and NaN <= error_bound is false
             T err = decompressed_data - data;
             if (err >= -this->error_bound && err <= this->error_bound) {
@@ -108,7 +118,7 @@ class LinearQuantizerOMP : public concepts::QuantizerOMPInterface<T, int> {
         T diff = data - pred;
         int quant_index = static_cast<int>(std::nearbyint(diff * this->double_error_bound_reciprocal));
         if (quant_index > -this->radius && quant_index < this->radius ) {
-            T decompressed_data = pred + quant_index * this->double_error_bound;
+            T decompressed_data = dequantize(pred, quant_index);
             T err = decompressed_data - data;
             if (err >= -this->error_bound && err <= this->error_bound) {
                 return quant_index;
@@ -134,7 +144,7 @@ class LinearQuantizerOMP : public concepts::QuantizerOMPInterface<T, int> {
 
 
     ALWAYS_INLINE T recover_pred(T pred, int quant_index) {
-        return pred + quant_index * this->double_error_bound;   // int16: no -radius
+        return dequantize(pred, quant_index);   // int16: no -radius
     }
 
     ALWAYS_INLINE T recover_unpred() { return unpred[index++]; }

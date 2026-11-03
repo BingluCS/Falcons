@@ -38,8 +38,8 @@ herr_t set_Falcons_conf_to_H5(const hid_t propertyList, Falcons::Config& conf) {
     auto confSizeReal = conf.save(buffer);
     cd_nelmts = std::ceil(confSizeReal / 1.0 / sizeof(int));
 
-    auto falconsfilter = H5Pget_filter_by_id(propertyList, H5Z_FILTER_Falcons, H5Z_FLAG_MANDATORY, NULL, NULL, 0, NULL,
-                                        NULL); // check if filter is set
+    auto falconsfilter = H5Pget_filter_by_id(propertyList, H5Z_FILTER_Falcons, nullptr, nullptr, nullptr, 0, nullptr,
+                                            nullptr); // check if filter is set
     if (0 > falconsfilter) {
         // filter not set, set filter. Notice that calling H5Pset_filter twice with the same filter id
         // will cause unexpected errors for decompression
@@ -63,8 +63,8 @@ herr_t get_Falcons_conf_from_H5(const hid_t propertyList, Falcons::Config& conf)
 
     // read cd_values from HDF5
     // note that cd_nelmts must be non-zero, otherwise, cd_values cannot be filled.
-    if (0 > H5Pget_filter_by_id(propertyList, H5Z_FILTER_Falcons, H5Z_FLAG_MANDATORY, &cd_nelmts, cd_values.data(), 0, NULL,
-                                NULL))
+    if (0 > H5Pget_filter_by_id(propertyList, H5Z_FILTER_Falcons, nullptr, &cd_nelmts, cd_values.data(), 0, nullptr,
+                                nullptr))
         H5Z_Falcons_PUSH_AND_GOTO(H5E_PLINE, H5E_CANTGET, 0, "unable to get current Falcons cd_values");
 
     // load cd_values into config

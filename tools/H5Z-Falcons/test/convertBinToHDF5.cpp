@@ -41,6 +41,35 @@ static size_t computeDataLength(size_t r5, size_t r4, size_t r3, size_t r2, size
     return dataLength;
 }
 
+template <typename T>
+static T *readData(const char *path, size_t count) {
+    FILE *f = fopen(path, "rb");
+    if (!f) {
+        perror(path);
+        exit(EXIT_FAILURE);
+    }
+    if (count > SIZE_MAX / sizeof(T)) {
+        fprintf(stderr, "Error: input size too large for %s\n", path);
+        fclose(f);
+        exit(EXIT_FAILURE);
+    }
+    T *data = static_cast<T *>(malloc(count * sizeof(T)));
+    if (!data && count != 0) {
+        fprintf(stderr, "Error: allocation failed for %s\n", path);
+        fclose(f);
+        exit(EXIT_FAILURE);
+    }
+    size_t nread = count ? fread(data, sizeof(T), count, f) : 0;
+    if (nread != count) {
+        fprintf(stderr, "Error reading %s: expected %zu elements, got %zu\n", path, count, nread);
+        free(data);
+        fclose(f);
+        exit(EXIT_FAILURE);
+    }
+    fclose(f);
+    return data;
+}
+
 int main(int argc, char *argv[]) {
     hid_t file_id, dataset_id, dataspace_id; /* identifiers */
     hsize_t dims[3];
@@ -94,11 +123,7 @@ int main(int argc, char *argv[]) {
     snprintf(database, 100, "/%s", varName);
 
     if (strcmp(datatype, "-f") == 0) {
-        FILE *f;
-        f = fopen(infile, "rb");
-        auto *data = static_cast<float *>(malloc(nbEle * sizeof(float)));
-        fread(data, sizeof(float), nbEle, f);
-        fclose(f);
+        auto *data = readData<float>(infile, nbEle);
 
         dataset_id = H5Dcreate2(file_id, database, H5T_IEEE_F32LE, dataspace_id, H5P_DEFAULT, H5P_DEFAULT, H5P_DEFAULT);
 
@@ -110,33 +135,21 @@ int main(int argc, char *argv[]) {
         printf("NDIMS: %i\n", ndims);
         free(data);
     } else if (strcmp(datatype, "-d") == 0) {
-        FILE *f;
-        f = fopen(infile, "rb");
-        double *data = static_cast<double *>(malloc(nbEle * sizeof(double)));
-        fread(data, sizeof(double), nbEle, f);
-        fclose(f);
+        double *data = readData<double>(infile, nbEle);
 
         dataset_id = H5Dcreate2(file_id, database, H5T_IEEE_F64LE, dataspace_id, H5P_DEFAULT, H5P_DEFAULT, H5P_DEFAULT);
 
         status = H5Dwrite(dataset_id, H5T_IEEE_F64LE, H5S_ALL, H5S_ALL, H5P_DEFAULT, data);
         free(data);
     } else if (strcmp(datatype, "-i32") == 0) {
-        FILE *f;
-        f = fopen(infile, "rb");
-        int *data = static_cast<int *>(malloc(nbEle * sizeof(int)));
-        fread(data, sizeof(int), nbEle, f);
-        fclose(f);
+        int *data = readData<int>(infile, nbEle);
 
         dataset_id = H5Dcreate2(file_id, database, H5T_STD_I32LE, dataspace_id, H5P_DEFAULT, H5P_DEFAULT, H5P_DEFAULT);
 
         status = H5Dwrite(dataset_id, H5T_STD_I32LE, H5S_ALL, H5S_ALL, H5P_DEFAULT, data);
         free(data);
     } else if (strcmp(datatype, "-i64") == 0) {
-        FILE *f;
-        f = fopen(infile, "rb");
-        int64_t *data = static_cast<int64_t *>(malloc(nbEle * sizeof(int64_t)));
-        fread(data, sizeof(int64_t), nbEle, f);
-        fclose(f);
+        int64_t *data = readData<int64_t>(infile, nbEle);
 
         dataset_id = H5Dcreate2(file_id, database, H5T_STD_I64LE, dataspace_id, H5P_DEFAULT, H5P_DEFAULT, H5P_DEFAULT);
 

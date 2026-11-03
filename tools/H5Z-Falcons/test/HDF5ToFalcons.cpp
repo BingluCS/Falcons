@@ -9,8 +9,10 @@
 
 // #include <dlfcn.h>
 #include <cerrno>
+#include <cinttypes>
 #include <cstdio>
 #include <cstdlib>
+#include <string>
 
 #include "H5Z_Falcons.hpp"
 #include "hdf5.h"
@@ -22,7 +24,6 @@ int main(int argc, char *argv[]) {
     // int dimSize = 0;
     // size_t r5 = 0, r4 = 0, r3 = 0, r2 = 0, r1 = 0;
     size_t nbEle = 0;
-    char hdf5FilePath[640], outputFilePath[640];
     hid_t file, dset, dcpl, space_id, dtype; /*Handles*/
     hid_t fid, sid, cpid, idsid;             /*Output Handles*/
     // H5Z_filter_t filter_id = 0;
@@ -49,8 +50,8 @@ int main(int argc, char *argv[]) {
         exit(0);
     }
 
-    snprintf(hdf5FilePath, sizeof(hdf5FilePath), "%s", argv[1]);
-    snprintf(outputFilePath, sizeof(outputFilePath), "%s.out.h5", hdf5FilePath);
+    const char *hdf5FilePath = argv[1];
+    const std::string outputFilePath = std::string(hdf5FilePath) + ".out.h5";
 
     /*Open the hdf5 file with Falcons-compressed data*/
     file = H5Fopen(hdf5FilePath, H5F_ACC_RDONLY, H5P_DEFAULT);
@@ -92,7 +93,7 @@ int main(int argc, char *argv[]) {
 
     // create output file /*Get Dimensions for writing*/
 
-    if (0 > (ndims = H5Sget_simple_extent_dims(space_id, dims, nullptr))) ERROR(H5Sget_simple_extent_dims);
+    if (0 > (ndims = H5Sget_simple_extent_dims(space_id, dims, nullptr))) H5Z_Falcons_ERROR(H5Sget_simple_extent_dims);
 
     int ndims_used = 0;
     for (int i = 0; i < ndims; i++) {
@@ -104,13 +105,13 @@ int main(int argc, char *argv[]) {
     dim = ndims_used;
 
     /* create HDF5 file */
-    if (0 > (fid = H5Fcreate(outputFilePath, H5F_ACC_TRUNC, H5P_DEFAULT, H5P_DEFAULT))) ERROR(H5Fcreate);
+    if (0 > (fid = H5Fcreate(outputFilePath.c_str(), H5F_ACC_TRUNC, H5P_DEFAULT, H5P_DEFAULT))) H5Z_Falcons_ERROR(H5Fcreate);
 
     /*Create dataspace. Setting maximum size */
-    if (0 > (sid = H5Screate_simple(dim, dims, NULL))) ERROR(H5Screate_simple);
+    if (0 > (sid = H5Screate_simple(dim, dims, NULL))) H5Z_Falcons_ERROR(H5Screate_simple);
 
     /* setup dataset creation properties */
-    if (0 > (cpid = H5Pcreate(H5P_DATASET_CREATE))) ERROR(H5Pcreate);
+    if (0 > (cpid = H5Pcreate(H5P_DATASET_CREATE))) H5Z_Falcons_ERROR(H5Pcreate);
 
     switch (type_class) {
         case H5T_FLOAT:
@@ -130,9 +131,9 @@ int main(int argc, char *argv[]) {
 
                 // write out file data
                 if (0 > (idsid = H5Dcreate(fid, DATASET, H5T_IEEE_F32LE, sid, H5P_DEFAULT, cpid, H5P_DEFAULT)))
-                    ERROR(H5Dcreate);
-                if (0 > H5Dwrite(idsid, H5T_IEEE_F32LE, H5S_ALL, H5S_ALL, H5P_DEFAULT, data)) ERROR(H5Dwrite);
-                if (0 > H5Dclose(idsid)) ERROR(H5Dclose);
+                    H5Z_Falcons_ERROR(H5Dcreate);
+                if (0 > H5Dwrite(idsid, H5T_IEEE_F32LE, H5S_ALL, H5S_ALL, H5P_DEFAULT, data)) H5Z_Falcons_ERROR(H5Dwrite);
+                if (0 > H5Dclose(idsid)) H5Z_Falcons_ERROR(H5Dclose);
 
                 free(data);
             } else  // 64bit: double
@@ -203,7 +204,7 @@ int main(int argc, char *argv[]) {
                         status = H5Dread(dset, H5T_STD_U64BE, H5S_ALL, H5S_ALL, H5P_DEFAULT, data);
                     int i;
                     printf("reconstructed data = ");
-                    for (i = 0; i < 20; i++) printf("%llu ", data[i]);
+                    for (i = 0; i < 20; i++) printf("%" PRIu64 " ", data[i]);
                     printf("\n");
                     free(data);
                 }
@@ -253,7 +254,7 @@ int main(int argc, char *argv[]) {
                         status = H5Dread(dset, H5T_STD_I64BE, H5S_ALL, H5S_ALL, H5P_DEFAULT, data);
                     int i;
                     printf("reconstructed data = ");
-                    for (i = 0; i < 20; i++) printf("%lld ", data[i]);
+                    for (i = 0; i < 20; i++) printf("%" PRId64 " ", data[i]);
                     printf("\n");
                     free(data);
                 }
@@ -275,9 +276,9 @@ int main(int argc, char *argv[]) {
     status = H5Fclose(file);
 
     /*Close and release writing resources*/
-    if (0 > H5Sclose(sid)) ERROR(H5Sclose);
-    if (0 > H5Pclose(cpid)) ERROR(H5Pclose);
-    if (0 > H5Fclose(fid)) ERROR(H5Fclose);
+    if (0 > H5Sclose(sid)) H5Z_Falcons_ERROR(H5Sclose);
+    if (0 > H5Pclose(cpid)) H5Z_Falcons_ERROR(H5Pclose);
+    if (0 > H5Fclose(fid)) H5Z_Falcons_ERROR(H5Fclose);
 
     return 0;
 }

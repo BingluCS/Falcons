@@ -2500,18 +2500,26 @@ class InterpolationDecomposition : public concepts::DecompositionInterface<T, in
     double interpolation(T *data, std::array<size_t, N> begin, std::array<size_t, N> end,
                          const std::string &interp_func, QuantizeFunc &&quantize_func, const int direction,
                          size_t stride = 1) {
-#ifdef __ARM_FEATURE_SVE2
+#if defined(__ARM_FEATURE_SVE2) || defined(__AVX2__)
         std::tie(real_eb, real_ebx2, real_ebx2_r) = quantizer.get_all_eb();
+        if constexpr (std::is_same_v<T, float>) {
+            // Float errors must not pass because the double bound rounded up.
+            float eb_f = static_cast<float>(real_eb);
+            if (static_cast<double>(eb_f) > real_eb)
+                eb_f = std::nextafter(eb_f, 0.0f);
+#ifdef __ARM_FEATURE_SVE2
+            real_eb = static_cast<double>(eb_f);
 #endif
 #ifdef __AVX2__
-        std::tie(real_eb, real_ebx2, real_ebx2_r) = quantizer.get_all_eb();
+            rel_eb_avx_f = _mm256_set1_ps(eb_f);
+            nrel_eb_avx_f = _mm256_set1_ps(-eb_f);
+#endif
+        }
+#endif
+#ifdef __AVX2__
         ebx2_r_avx = _mm256_set1_pd(real_ebx2_r);
         ebx2_avx = _mm256_set1_pd(real_ebx2);
-        if constexpr (std::is_same_v<T, float>) {
-            rel_eb_avx_f = _mm256_set1_ps(real_eb);
-            nrel_eb_avx_f = _mm256_set1_ps(-real_eb);
-        }
-        else if constexpr (std::is_same_v<T, double>) {
+        if constexpr (std::is_same_v<T, double>) {
             rel_eb_avx_d = _mm256_set1_pd(real_eb);
             nrel_eb_avx_d = _mm256_set1_pd(-real_eb);
         }

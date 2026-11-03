@@ -4,6 +4,7 @@ find_package(GTest QUIET)
 if(NOT GTest_FOUND)
     message(STATUS "GTest not found locally; fetching from GitHub...")
     include(FetchContent)
+    option(BUILD_GMOCK "Build Google Mock" OFF)
     FetchContent_Declare(
             googletest
             GIT_REPOSITORY https://github.com/google/googletest.git
@@ -31,7 +32,7 @@ foreach (TEST_SRC IN LISTS TEST_SOURCES)
 endforeach()
 
 # Standalone regression programs exercise internal buffers and tuning paths.
-file(GLOB V11_TEST_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/v11_*_test.cpp")
+file(GLOB V11_TEST_SOURCES CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/v11_*_test.cpp")
 foreach (TEST_SRC IN LISTS V11_TEST_SOURCES)
     get_filename_component(TEST_NAME ${TEST_SRC} NAME_WE)
     add_executable(${TEST_NAME} ${TEST_SRC})

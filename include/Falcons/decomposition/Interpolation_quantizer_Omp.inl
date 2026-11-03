@@ -7,6 +7,21 @@
  */
 
 namespace Falcons {
+    template <class Func>
+    static ALWAYS_INLINE void omp_1d_for_chunks(size_t chunks, size_t threads, Func &&func) {
+        const size_t base = chunks / threads;
+        const size_t remainder = chunks % threads;
+        // Keep contiguous logical streams independent of the runtime's static partition policy.
+        #pragma omp parallel for schedule(static, 1)
+        for (size_t worker = 0; worker < threads; ++worker) {
+            const size_t first = worker * base + std::min(worker, remainder);
+            const size_t last = first + base + (worker < remainder);
+            for (size_t chunk = first; chunk < last; ++chunk) {
+                func(chunk, static_cast<int>(worker));
+            }
+        }
+    }
+
 #ifdef __AVX2__
     // uint16 quant-code pack/widen helpers (shared with the serial .inl via the include guard).
 #ifndef Falcons_QUANT16_HELPERS
@@ -287,10 +302,8 @@ namespace Falcons {
             const __m256 factor = _mm256_set1_ps(0.5f);
             if constexpr (EnableInnerOmp) {
                 const size_t vec_chunks = odd_len > step ? (odd_len - 1) / step : 0;
-                #pragma omp parallel for
-                for (size_t chunk = 0; chunk < vec_chunks; ++chunk) {
+                omp_1d_for_chunks(vec_chunks, nThreads, [&](size_t chunk, int cur_tid) {
                     size_t cur_i = chunk * step;
-                    int cur_tid = omp_get_thread_num();
                     T a[8], b[8];
                     #pragma unroll
                     for (size_t j = 0; j < step; ++j) {
@@ -301,7 +314,7 @@ namespace Falcons {
                     __m256 sum = _mm256_mul_ps(_mm256_add_ps(_mm256_loadu_ps(a), _mm256_loadu_ps(b)), factor);
                     size_t start = cur_i;
                     quantize_float<CompMode, step, false, SkipOverwrite>(sum, start, odd_data, odd_offset, odd_len, cur_tid);
-                }
+                });
                 i = vec_chunks * step;
             } else {
                 const __m256 zero_bound = avx2_zero_code_bound<CompMode == COMPMODE::COMP && avx2_zero_code_enabled<SkipOverwrite>>(
@@ -333,10 +346,8 @@ namespace Falcons {
             const __m256d factor = _mm256_set1_pd(0.5);
             if constexpr (EnableInnerOmp) {
                 const size_t vec_chunks = odd_len > step ? (odd_len - 1) / step : 0;
-                #pragma omp parallel for
-                for (size_t chunk = 0; chunk < vec_chunks; ++chunk) {
+                omp_1d_for_chunks(vec_chunks, nThreads, [&](size_t chunk, int cur_tid) {
                     size_t cur_i = chunk * step;
-                    int cur_tid = omp_get_thread_num();
                     T a[4], b[4];
                     #pragma unroll
                     for (size_t j = 0; j < step; ++j) {
@@ -347,7 +358,7 @@ namespace Falcons {
                     __m256d sum = _mm256_mul_pd(_mm256_add_pd(_mm256_loadu_pd(a), _mm256_loadu_pd(b)), factor);
                     size_t start = cur_i;
                     quantize_double<CompMode, step, false, SkipOverwrite>(sum, start, odd_data, odd_offset, odd_len, cur_tid);
-                }
+                });
                 i = vec_chunks * step;
             } else {
                 const __m256d zero_bound = avx2_zero_code_bound<CompMode == COMPMODE::COMP && avx2_zero_code_enabled<SkipOverwrite>>(
@@ -377,7 +388,7 @@ namespace Falcons {
         }
         for (; i + 1 < odd_len; ++i) {
             size_t start = ((i << 1) + 1) * offset;
-            quantize_func(cur_ij_offset + start, data[cur_ij_offset + start],
+            quantize_point<CompMode, SkipOverwrite>(cur_ij_offset + start, data[cur_ij_offset + start],
                           interp_linear(data[cur_ij_offset + (i << 1) * offset],
                                         data[cur_ij_offset + ((i << 1) + 2) * offset]), tid);
         }
@@ -421,10 +432,8 @@ namespace Falcons {
             const __m256 factor = _mm256_set1_ps(1.0f / 16.0f);
             if constexpr (EnableInnerOmp) {
                 const size_t vec_chunks = even_len > step + 2 ? (even_len - 3) / step : 0;
-                #pragma omp parallel for
-                for (size_t chunk = 0; chunk < vec_chunks; ++chunk) {
+                omp_1d_for_chunks(vec_chunks, nThreads, [&](size_t chunk, int cur_tid) {
                     size_t cur_i = chunk * step;
-                    int cur_tid = omp_get_thread_num();
                     T a[8], b[8], c[8], d[8];
                     #pragma unroll
                     for (size_t j = 0; j < step; ++j) {
@@ -442,7 +451,7 @@ namespace Falcons {
                         factor);
                     size_t start = cur_i + 1;
                     quantize_float<CompMode, step, false, SkipOverwrite>(sum, start, odd_data, odd_offset, odd_len, cur_tid);
-                }
+                });
                 i = vec_chunks * step;
             } else {
                 const __m256 zero_bound = avx2_zero_code_bound<CompMode == COMPMODE::COMP && avx2_zero_code_enabled<SkipOverwrite>>(
@@ -485,10 +494,8 @@ namespace Falcons {
             const __m256d factor = _mm256_set1_pd(1.0 / 16.0);
             if constexpr (EnableInnerOmp) {
                 const size_t vec_chunks = even_len > step + 2 ? (even_len - 3) / step : 0;
-                #pragma omp parallel for
-                for (size_t chunk = 0; chunk < vec_chunks; ++chunk) {
+                omp_1d_for_chunks(vec_chunks, nThreads, [&](size_t chunk, int cur_tid) {
                     size_t cur_i = chunk * step;
-                    int cur_tid = omp_get_thread_num();
                     T a[4], b[4], c[4], d[4];
                     #pragma unroll
                     for (size_t j = 0; j < step; ++j) {
@@ -506,7 +513,7 @@ namespace Falcons {
                         factor);
                     size_t start = cur_i + 1;
                     quantize_double<CompMode, step, false, SkipOverwrite>(sum, start, odd_data, odd_offset, odd_len, cur_tid);
-                }
+                });
                 i = vec_chunks * step;
             } else {
                 const __m256d zero_bound = avx2_zero_code_bound<CompMode == COMPMODE::COMP && avx2_zero_code_enabled<SkipOverwrite>>(
@@ -546,7 +553,7 @@ namespace Falcons {
         }
         for (; i + 3 < even_len; ++i) {
             size_t start = ((i << 1) + 3) * offset;
-            quantize_func(cur_ij_offset + start, data[cur_ij_offset + start],
+            quantize_point<CompMode, SkipOverwrite>(cur_ij_offset + start, data[cur_ij_offset + start],
                           interp_cubic(data[cur_ij_offset + (i << 1) * offset],
                                        data[cur_ij_offset + ((i << 1) + 2) * offset],
                                        data[cur_ij_offset + ((i << 1) + 4) * offset],
@@ -676,14 +683,12 @@ namespace Falcons {
                     float tmp[8];
                     _mm256_storeu_ps(tmp, decompressed);
 
-                    if constexpr (!SkipOverwrite) {
-                        if (avx2_stride2_stores_enabled && offset == 1) {
-                            avx2_store_stride2(data + start, tmp);
-                        } else {
-                            #pragma unroll
-                            for (size_t j = 0; j < step; ++j) {
-                                data[(start + (j << 1)) * offset] = tmp[j];
-                            }
+                    if (avx2_stride2_stores_enabled && offset == 1) {
+                        avx2_store_stride2(data + start, tmp);
+                    } else {
+                        #pragma unroll
+                        for (size_t j = 0; j < step; ++j) {
+                            data[(start + (j << 1)) * offset] = tmp[j];
                         }
                     }
                     unsigned esc = static_cast<unsigned>(_mm256_movemask_ps(_mm256_castsi256_ps(
@@ -783,14 +788,12 @@ namespace Falcons {
                     T tmp[4];
                     _mm256_storeu_pd(tmp, decompressed);
 
-                    if constexpr (!SkipOverwrite) {
-                        if (avx2_stride2_stores_enabled && offset == 1) {
-                            avx2_store_stride2(data + start, tmp);
-                        } else {
-                            #pragma unroll
-                            for (size_t j = 0; j < step; ++j) {
-                                data[(start + (j << 1)) * offset] = tmp[j];
-                            }
+                    if (avx2_stride2_stores_enabled && offset == 1) {
+                        avx2_store_stride2(data + start, tmp);
+                    } else {
+                        #pragma unroll
+                        for (size_t j = 0; j < step; ++j) {
+                            data[(start + (j << 1)) * offset] = tmp[j];
                         }
                     }
                     unsigned esc = static_cast<unsigned>(_mm_movemask_ps(_mm_castsi128_ps(
@@ -939,14 +942,12 @@ namespace Falcons {
                     float tmp[8];
                     _mm256_storeu_ps(tmp, decompressed);
 
-                    if constexpr (!SkipOverwrite) {
-                        if (avx2_stride2_stores_enabled && offset == 1) {
-                            avx2_store_stride2(data + start, tmp);
-                        } else {
-                            #pragma unroll
-                            for (size_t j = 0; j < step; ++j) {
-                                data[(start + (j << 1)) * offset] = tmp[j];
-                            }
+                    if (avx2_stride2_stores_enabled && offset == 1) {
+                        avx2_store_stride2(data + start, tmp);
+                    } else {
+                        #pragma unroll
+                        for (size_t j = 0; j < step; ++j) {
+                            data[(start + (j << 1)) * offset] = tmp[j];
                         }
                     }
                     unsigned esc = static_cast<unsigned>(_mm256_movemask_ps(_mm256_castsi256_ps(
@@ -961,7 +962,7 @@ namespace Falcons {
             }
             for (; i + 3 < even_len; ++i) {
                 size_t start = ((i << 1) + 3) * offset;
-                quantize_func(cur_ij_offset + start, data[start],
+                quantize_point<CompMode, SkipOverwrite>(cur_ij_offset + start, data[start],
                               interp_cubic(buf[i], buf[i + 1], buf[i + 2], buf[i + 3]), tid);
             }
         }
@@ -1076,7 +1077,7 @@ namespace Falcons {
             }
             for (; i + 3 < even_len; ++i) {
                 size_t start = ((i << 1) + 3) * offset;
-                quantize_func(cur_ij_offset + start, data[start],
+                quantize_point<CompMode, SkipOverwrite>(cur_ij_offset + start, data[start],
                               interp_cubic(buf[i], buf[i + 1], buf[i + 2], buf[i + 3]), tid);
             }
         }
@@ -1897,7 +1898,7 @@ namespace Falcons {
         }
         for (; i + 1 < odd_len; ++i) {
             size_t start = ((i << 1) + 1) * offset;
-            quantize_func(cur_ij_offset + start, data[cur_ij_offset + start],
+            quantize_point<CompMode, SkipOverwrite>(cur_ij_offset + start, data[cur_ij_offset + start],
                           interp_linear(data[cur_ij_offset + (i << 1) * offset],
                                         data[cur_ij_offset + ((i << 1) + 2) * offset]), tid);
         }
@@ -2031,7 +2032,7 @@ namespace Falcons {
         }
         for (; i + 3 < even_len; ++i) {
             size_t start = ((i << 1) + 3) * offset;
-            quantize_func(cur_ij_offset + start, data[cur_ij_offset + start],
+            quantize_point<CompMode, SkipOverwrite>(cur_ij_offset + start, data[cur_ij_offset + start],
                           interp_cubic(data[cur_ij_offset + (i << 1) * offset],
                                        data[cur_ij_offset + ((i << 1) + 2) * offset],
                                        data[cur_ij_offset + ((i << 1) + 4) * offset],
@@ -3116,9 +3117,22 @@ namespace Falcons {
         auto odd_len = len / 2;
         auto even_len = len - odd_len;
         size_t i = 0;
+        if constexpr (EnableInnerOmp && (std::is_same_v<T, float> || std::is_same_v<T, double>)) {
+            const size_t step = AVX_256_parallelism;
+            const size_t vec_chunks = odd_len > step ? (odd_len - 1) / step : 0;
+            omp_1d_for_chunks(vec_chunks, nThreads, [&](size_t chunk, int cur_tid) {
+                for (size_t j = chunk * step; j < (chunk + 1) * step; ++j) {
+                    size_t start = ((j << 1) + 1) * offset;
+                    quantize_point<CompMode, SkipOverwrite>(cur_ij_offset + start, data[cur_ij_offset + start],
+                                  interp_linear(data[cur_ij_offset + (j << 1) * offset],
+                                                data[cur_ij_offset + ((j << 1) + 2) * offset]), cur_tid);
+                }
+            });
+            i = vec_chunks * step;
+        }
         for (; i + 1 < odd_len; ++i) {
             size_t start = ((i << 1) + 1) * offset;
-            quantize_func(cur_ij_offset + start, data[cur_ij_offset + start],
+            quantize_point<CompMode, SkipOverwrite>(cur_ij_offset + start, data[cur_ij_offset + start],
                           interp_linear(data[cur_ij_offset + (i << 1) * offset],
                                         data[cur_ij_offset + ((i << 1) + 2) * offset]), tid);
         }
@@ -3154,9 +3168,24 @@ namespace Falcons {
         quantize_point<CompMode, SkipOverwrite>(cur_ij_offset + offset, data[cur_ij_offset + offset], pred_first, tid);
 
         size_t i = 0;
+        if constexpr (EnableInnerOmp && (std::is_same_v<T, float> || std::is_same_v<T, double>)) {
+            const size_t step = AVX_256_parallelism;
+            const size_t vec_chunks = even_len > step + 2 ? (even_len - 3) / step : 0;
+            omp_1d_for_chunks(vec_chunks, nThreads, [&](size_t chunk, int cur_tid) {
+                for (size_t j = chunk * step; j < (chunk + 1) * step; ++j) {
+                    size_t start = ((j << 1) + 3) * offset;
+                    quantize_point<CompMode, SkipOverwrite>(cur_ij_offset + start, data[cur_ij_offset + start],
+                                  interp_cubic(data[cur_ij_offset + (j << 1) * offset],
+                                               data[cur_ij_offset + ((j << 1) + 2) * offset],
+                                               data[cur_ij_offset + ((j << 1) + 4) * offset],
+                                               data[cur_ij_offset + ((j << 1) + 6) * offset]), cur_tid);
+                }
+            });
+            i = vec_chunks * step;
+        }
         for (; i + 3 < even_len; ++i) {
             size_t start = ((i << 1) + 3) * offset;
-            quantize_func(cur_ij_offset + start, data[cur_ij_offset + start],
+            quantize_point<CompMode, SkipOverwrite>(cur_ij_offset + start, data[cur_ij_offset + start],
                           interp_cubic(data[cur_ij_offset + (i << 1) * offset],
                                        data[cur_ij_offset + ((i << 1) + 2) * offset],
                                        data[cur_ij_offset + ((i << 1) + 4) * offset],

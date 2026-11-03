@@ -28,7 +28,7 @@ extern "C" {
 #endif
 
 extern hid_t H5Z_Falcons_ERRCLASS;
-#define ERROR(FNAME)                                                                    \
+#define H5Z_Falcons_ERROR(FNAME)                                                        \
     do {                                                                                \
         int saved_errno = errno;                                                         \
         fprintf(stderr, #FNAME " failed at line %d, errno=%d (%s)\n", __LINE__, saved_errno, \

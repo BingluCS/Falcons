@@ -1,7 +1,9 @@
 #include "H5Z_Falcons.hpp"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <limits>
 #include <stdexcept>
 #include <vector>
 
@@ -35,7 +37,17 @@ static void roundtrip(hid_t datatype, Falcons::EB mode) {
     dataset = H5Dopen2(file, "field", H5P_DEFAULT);
     check(dataset >= 0 && H5Dread(dataset, datatype, H5S_ALL, H5S_ALL, H5P_DEFAULT, output.data()) >= 0,
           "read dataset");
-    for (T value : output) check(std::isfinite(value), "non-finite output");
+    const auto [minimum, maximum] = std::minmax_element(input.begin(), input.end());
+    const double bound = mode == Falcons::EB_REL
+        ? (static_cast<double>(*maximum) - static_cast<double>(*minimum)) * conf.relErrorBound
+        : conf.absErrorBound;
+    for (size_t i = 0; i < output.size(); ++i) {
+        check(std::isfinite(output[i]), "non-finite output");
+        const double slack = 4 * std::numeric_limits<T>::epsilon() *
+                             std::max(1.0, std::abs(static_cast<double>(input[i])));
+        check(std::abs(static_cast<double>(output[i]) - input[i]) <= bound + slack,
+              "HDF5 reconstruction exceeds error bound");
+    }
 
     H5Dclose(dataset);
     H5Pclose(dcpl);

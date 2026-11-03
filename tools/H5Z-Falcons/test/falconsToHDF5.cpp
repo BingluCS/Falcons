@@ -12,6 +12,7 @@
 #include <cerrno>
 #include <cstdio>
 #include <cstdlib>
+#include <string>
 
 #include "hdf5.h"
 // #include "H5Cpp.h"
@@ -74,8 +75,6 @@ void process_data(const Falcons::Config &conf, const char *oriFilePath, int data
 }
 
 int main(int argc, char *argv[]) {
-    char oriFilePath[640], outputFilePath[640];
-
     if (argc < 3) {
         printf("Test case: falconsToHDF5 [dataType] [srcFilePath] [dimension sizes...]\n");
         printf("Example1 : falconsToHDF5 -f testdata/x86/testfloat_8_8_128.dat 8 8 128\n");
@@ -96,7 +95,7 @@ int main(int argc, char *argv[]) {
         return 0;
     }
 
-    snprintf(oriFilePath, 640, "%s", argv[2]);
+    const char *oriFilePath = argv[2];
 
     std::vector<int> dimensions;
     for (int i = 3; i < argc && i < 8; ++i) {
@@ -104,11 +103,11 @@ int main(int argc, char *argv[]) {
     }
     std::reverse(dimensions.begin(), dimensions.end());  // slowest to fastest
 
-    snprintf(outputFilePath, 640, "%s.falcons.h5", oriFilePath);
+    const std::string outputFilePath = std::string(oriFilePath) + ".falcons.h5";
 
     hid_t sid, cpid, fid;
     /* create HDF5 file */
-    if (0 > (fid = H5Fcreate(outputFilePath, H5F_ACC_TRUNC, H5P_DEFAULT, H5P_DEFAULT))) {
+    if (0 > (fid = H5Fcreate(outputFilePath.c_str(), H5F_ACC_TRUNC, H5P_DEFAULT, H5P_DEFAULT))) {
         printf("Error in H5Pcreate");
         exit(0);
     }
@@ -221,7 +220,7 @@ int main(int argc, char *argv[]) {
         printf("Error in H5Fclose");
         exit(0);
     }
-    printf("Output hdf5 file: %s\n", outputFilePath);
+    printf("Output hdf5 file: %s\n", outputFilePath.c_str());
     if (H5Zunregister(H5Z_FILTER_Falcons) < 0) return -1;
     H5close();
     return 0;

@@ -1,6 +1,7 @@
 #include "Falcons/api/falcons.hpp"
 
 #include <cmath>
+#include <cstring>
 #include <cstdio>
 #include <memory>
 #include <stdexcept>
@@ -18,7 +19,7 @@ static void check(bool condition, const char *message) {
 static void run_case(int compress_threads, int decompress_threads, bool dynamic) {
     omp_set_num_threads(compress_threads);
     omp_set_dynamic(dynamic ? 1 : 0);
-    Falcons::Config config(8, 8, 128);
+    Falcons::Config config(40, 40, 64);
     config.cmprAlgo = Falcons::ALGO_INTERP;
     config.errorBoundMode = Falcons::EB_ABS;
     config.absErrorBound = 0.01;
@@ -31,6 +32,18 @@ static void run_case(int compress_threads, int decompress_threads, bool dynamic)
     std::unique_ptr<char[]> compressed(Falcons_compress(config, data.data(), compressed_size));
     check(omp_get_max_threads() == compress_threads && omp_get_dynamic() == int(dynamic),
           "compression changed caller OpenMP settings");
+    Falcons::Config stream_config;
+    Falcons_read_config(stream_config, compressed.get(), compressed_size);
+    int saved_threads = 1;
+    if (compress_threads > 1) {
+        check(stream_config.openmp, "compression did not use the OpenMP path");
+        const size_t header_size = static_cast<unsigned char>(compressed[0]);
+        check(compressed_size - header_size >= sizeof(int), "missing OpenMP thread count");
+        std::memcpy(&saved_threads, compressed.get() + header_size, sizeof(saved_threads));
+        check(saved_threads == compress_threads, "compression team differs from the requested team");
+    } else {
+        check(!stream_config.openmp, "single-thread compression did not use the serial path");
+    }
     omp_set_num_threads(decompress_threads);
     Falcons::Config recovered_config;
     std::unique_ptr<float[]> recovered(Falcons_decompress<float>(recovered_config, compressed.get(), compressed_size));
@@ -39,8 +52,8 @@ static void run_case(int compress_threads, int decompress_threads, bool dynamic)
     for (size_t i = 0; i < data.size(); ++i)
         check(std::abs(double(original[i]) - recovered[i]) <= config.absErrorBound + 1e-6,
               "parallel API reconstruction exceeds error bound");
-    std::printf("PASS OMP API compress=%d decompress=%d dynamic=%d\n",
-                compress_threads, decompress_threads, int(dynamic));
+    std::printf("PASS OMP API compress=%d streams=%d decompress_default=%d dynamic=%d\n",
+                compress_threads, saved_threads, decompress_threads, int(dynamic));
 }
 
 static void run_high_escape() {
