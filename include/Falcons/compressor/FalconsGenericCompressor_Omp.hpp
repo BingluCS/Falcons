@@ -9,7 +9,16 @@
 #ifndef Falcons_COMPRESSOR_TYPE_ONE_OMP_HPP
 #define Falcons_COMPRESSOR_TYPE_ONE_OMP_HPP
 
+#include <algorithm>
+#include <cstdlib>
 #include <cstring>
+#include <exception>
+#include <limits>
+#include <memory>
+#include <new>
+#include <stdexcept>
+#include <utility>
+#include <vector>
 #ifdef _OPENMP
 #include <omp.h>
 #endif
@@ -18,6 +27,7 @@
 #include "Falcons/def.hpp"
 #include "Falcons/encoder/Encoder.hpp"
 #include "Falcons/lossless/Lossless.hpp"
+#include "Falcons/utils/BufferBounds.hpp"
 #include "Falcons/utils/Config.hpp"
 #include "Falcons/utils/FileUtil.hpp"
 #include "Falcons/utils/Timer.hpp"
@@ -35,9 +45,14 @@ namespace Falcons {
 
 template <class T, uint N, class Decomposition, class Encoder, class Lossless>
 class FalconsGenericCompressor_OMP : public concepts::CompressorInterface<T> {
+    struct TemporaryStorageGuard {
+        Decomposition &decomposition;
+        ~TemporaryStorageGuard() { decomposition.release_temporary_storage(); }
+    };
+
    public:
     FalconsGenericCompressor_OMP(Decomposition decomposition, Encoder encoder, Lossless lossless)
-        : decomposition(decomposition), encoder(encoder), lossless(lossless) {
+        : decomposition(std::move(decomposition)), encoder(std::move(encoder)), lossless(std::move(lossless)) {
         using QuantT = std::remove_pointer_t<std::remove_pointer_t<std::tuple_element_t<0,
             decltype(std::declval<Decomposition&>().compress(std::declval<const Config&>(), std::declval<T*>()))>>>;
         static_assert(std::is_base_of<concepts::DecompositionInterface_OMP<T, QuantT, N>, Decomposition>::value,
@@ -59,140 +74,79 @@ class FalconsGenericCompressor_OMP : public concepts::CompressorInterface<T> {
 #endif
 
 
-        auto cmpDataPos = cmpData;
-        #ifdef _OPENMP
-        auto default_nthreads = omp_get_max_threads();
-        //std::cout<<default_nthreads<<" "<<quant_inds_size<<std::endl;
-        auto best_num_threads = default_nthreads;// std::min(default_nthreads, static_cast<int>(quant_inds_size / (1u<<16)));
-        //std::cout<<best_num_threads<<std::endl;
-        if (best_num_threads > 1) {
-            // size_t cur_bufferSize = std::max<size_t>(1000, 2 * 1.2 * sizeof(T) * local_quant_index[0].value * best_num_threads);
-            // uchar* buffer = new (std::align_val_t(64)) uchar[cur_bufferSize * best_num_threads];
-            omp_set_num_threads(best_num_threads);
-            //uchar * offset_block_pos = buffer_pos + sizeof(int);
-            //size_t bins_per_thread;
-            // auto quant_inds_data = quant_inds;
-            std::vector<size_t>block_byte_offsets;
-            // size_t offset_quant_inds_size;
-            // size_t total_huffman_size = 0;
-            int nthreads = best_num_threads;
-            size_t offset_chunk_size = nthreads * sizeof (size_t);
-            size_t total_zstd_size = 0;
-            block_byte_offsets.resize(nthreads);
-            write<int>(nthreads, cmpDataPos);
-            // Timer timer1(true);
-            #pragma omp parallel
-            {
-                // #pragma omp single 
-                // {
-                //     Timer timer1(true);
-                // }   
+        const int nthreads = decomposition.compression_thread_count();
+        if (nthreads <= 0) throw std::runtime_error("Invalid decomposition thread count");
+        const size_t header_size = buffer_bounds::add(
+            sizeof(int), buffer_bounds::mul(static_cast<size_t>(nthreads), sizeof(size_t)));
+        if (!cmpData || cmpCap < header_size)
+            throw std::length_error(Falcons_ERROR_COMP_BUFFER_NOT_LARGE_ENOUGH);
+
+        struct FreeBuffer { void operator()(uchar *p) const { std::free(p); } };
+        using Buffer = std::unique_ptr<uchar, FreeBuffer>;
+        std::vector<Buffer> blocks(nthreads);
+        std::vector<size_t> block_sizes(nthreads);
+        auto compress_block = [&](int tid, Encoder &cur_encoder) {
+            const int quant_count = local_quant_index[tid].value;
+            if (quant_count < 0) throw std::length_error("Invalid quantization count");
+            const size_t scratch_size = buffer_bounds::scratch_bound<T>(
+                decomposition.local_unpred_count(tid), static_cast<size_t>(quant_count));
+            Buffer scratch(static_cast<uchar *>(std::malloc(scratch_size)));
+            if (!scratch) throw std::bad_alloc();
+            uchar *pos = scratch.get();
+            if (tid == nthreads - 1) decomposition.save2(pos);
+            decomposition.save3(pos, tid);
+            if (nthreads == 1) write<size_t>(static_cast<size_t>(quant_count), pos);
+            else write<int>(quant_count, pos);
+            cur_encoder.preprocess_encode(local_quant_inds[tid], quant_count,
+                                          decomposition.get_out_range().second);
+            cur_encoder.save(pos);
+            cur_encoder.encode(local_quant_inds[tid], quant_count, pos);
+            cur_encoder.postprocess_encode();
+            const size_t source_size = static_cast<size_t>(pos - scratch.get());
+            const size_t zstd_bound = ZSTD_compressBound(source_size);
+            if (ZSTD_isError(zstd_bound)) throw std::length_error("Zstd capacity overflow");
+            const size_t capacity = buffer_bounds::add(sizeof(size_t), std::max(zstd_bound, source_size));
+            Buffer block(static_cast<uchar *>(std::malloc(capacity)));
+            if (!block) throw std::bad_alloc();
+            block_sizes[tid] = lossless.compress(scratch.get(), source_size, block.get(), capacity);
+            if (block_sizes[tid] > capacity) throw std::length_error("Invalid lossless output size");
+            blocks[tid] = std::move(block);
+        };
+
+        if (nthreads == 1) {
+            compress_block(0, encoder);
+        } else {
+            #ifdef _OPENMP
+            #pragma omp parallel for num_threads(nthreads)
+            #endif
+            for (int tid = 0; tid < nthreads; ++tid) {
                 Encoder cur_encoder;
-                auto tid = omp_get_thread_num();
-                // auto temp_buffer_pos0 = buffer_pos + tid * sizeof(int);
-                // decomposition.save3(temp_buffer_pos0, tid);
-                // write<int>(local_quant_index[tid].value, temp_buffer_pos0);
-                size_t cur_bufferSize = std::max<size_t>(1000, 1.2 * (cur_encoder.size_est_without_init() + sizeof(T) * local_quant_index[tid].value));
-                auto cur_buffer = static_cast<uchar *>(malloc(cur_bufferSize)); 
-                // uchar* cur_buffer = new (std::align_val_t(64)) uchar[cur_bufferSize];
-                // auto cur_buffer = buffer + tid * cur_bufferSize;
-                auto cur_buffer_pos = cur_buffer;
-                if(tid == best_num_threads - 1)
-                    decomposition.save2(cur_buffer_pos);
-
-                decomposition.save3(cur_buffer_pos, tid);
-                write<int>(local_quant_index[tid].value, cur_buffer_pos);
-                cur_encoder.preprocess_encode(local_quant_inds[tid], local_quant_index[tid].value, 
-                    decomposition.get_out_range().second);
-                cur_encoder.save(cur_buffer_pos);
-                cur_encoder.encode(local_quant_inds[tid], local_quant_index[tid].value, cur_buffer_pos);
-                cur_encoder.postprocess_encode();
-                auto cur_outSize = cur_buffer_pos - cur_buffer;
-
-                size_t lossless_bufferSize = std::max<size_t>(1000, 1.2 * sizeof(uchar) * cur_outSize);
-                auto lossless_buffer = static_cast<uchar *>(malloc(lossless_bufferSize)); 
-                auto lossless_buffer_pos = lossless_buffer; 
-                auto lossless_outSize = lossless.compress(cur_buffer, cur_outSize, lossless_buffer_pos, lossless_bufferSize);
-                block_byte_offsets[tid] = lossless_outSize;
-  
-                #pragma omp barrier
-                #pragma omp single
-                {
-                    size_t prefix_sum = 0;
-                    
-                    for (int i = 0; i < nthreads; i++){
-                        auto tmp = block_byte_offsets[i];
-                        block_byte_offsets[i] = prefix_sum;
-                        prefix_sum =  prefix_sum + tmp;
-                    }
-                    total_zstd_size =  prefix_sum;
-                }
-                auto temp_cmpData_pos = cmpDataPos + tid * sizeof(size_t);
-                write<size_t>(block_byte_offsets[tid],temp_cmpData_pos);
-                temp_cmpData_pos = cmpDataPos + offset_chunk_size + block_byte_offsets[tid];
-                write<uchar>(lossless_buffer, lossless_outSize,  temp_cmpData_pos);
-
-                free(lossless_buffer);
-                free(cur_buffer);
-
+                compress_block(tid, cur_encoder);
             }
-            // free(buffer);
-            omp_set_num_threads(default_nthreads);
-            cmpDataPos += offset_chunk_size + total_zstd_size;
         }
-            
-        else{
-            size_t quant_inds_size = local_quant_index[0].value;
-            size_t bufferSize = std::max<size_t>(
-            1000, 1.2 * (decomposition.size_est() + encoder.size_est_without_init() + sizeof(T) * quant_inds_size));
 
-            auto buffer = static_cast<uchar *>(malloc(bufferSize));
-            uchar *buffer_pos = buffer;
-
-            write<int>(1, cmpDataPos); //1 thread
-            decomposition.save2(buffer_pos);
-            decomposition.save3(buffer_pos, 0);
-            write<size_t>(quant_inds_size, buffer_pos);
-            // Timer timer1(true);
-            encoder.preprocess_encode(local_quant_inds[0], local_quant_index[0].value, 
-                decomposition.get_out_range().second);
-                    //                         timer1.stop("preprocess ");
-                    // timer1.start();
-            encoder.save(buffer_pos);
-            encoder.encode(local_quant_inds[0], local_quant_index[0].value, buffer_pos);
-            //   timer1.stop("encode ");
-            encoder.postprocess_encode();
-            auto currentSize = buffer_pos - buffer;
-            cmpCap-=cmpDataPos-cmpData;
-
-            write<size_t>(0, cmpDataPos); //offset = 0;
-            auto zstdSize = lossless.compress(buffer, currentSize, cmpDataPos, cmpCap);
-            cmpDataPos+=zstdSize;
-            free(buffer);
+        std::vector<size_t> offsets(nthreads);
+        size_t payload_size = 0;
+        for (int tid = 0; tid < nthreads; ++tid) {
+            offsets[tid] = payload_size;
+            payload_size = buffer_bounds::add(payload_size, block_sizes[tid]);
         }
-        #else
-            size_t bufferSize = std::max<size_t>(
-            1000, 1.2 * (decomposition.size_est() + encoder.size_est_without_init() + sizeof(T) * quant_inds_size));
-
-            auto buffer = static_cast<uchar *>(malloc(bufferSize));
-            uchar *buffer_pos = buffer;
-
-            write<int>(1, cmpDataPos); //1 thread
-            decomposition.save2(buffer_pos);
-            decomposition.save3(buffer_pos, 0);
-            write<size_t>(quant_inds_size, buffer_pos);
-            encoder.preprocess_encode(local_quant_inds[0], local_quant_index[0].value, decomposition.get_out_range().second);
-            encoder.save(buffer_pos);
-            encoder.encode(local_quant_inds[0], local_quant_index[0].value, buffer_pos);
-            encoder.postprocess_encode();
-            auto currentSize = buffer_pos - buffer;
-            cmpCap-=cmpDataPos-cmpData;
-
-            write<size_t>(0, cmpDataPos); //offset = 0;
-            auto zstdSize = lossless.compress(buffer, currentSize, cmpDataPos, cmpCap);
-            cmpDataPos+=zstdSize;
-            free(buffer);
-        #endif
+        const size_t total_size = buffer_bounds::add(header_size, payload_size);
+        if (total_size > cmpCap) throw std::length_error(Falcons_ERROR_COMP_BUFFER_NOT_LARGE_ENOUGH);
+        uchar *cmpDataPos = cmpData;
+        write<int>(nthreads, cmpDataPos);
+        for (size_t offset : offsets) write<size_t>(offset, cmpDataPos);
+        if (nthreads == 1) {
+            write(blocks[0].get(), block_sizes[0], cmpDataPos);
+        } else {
+            #ifdef _OPENMP
+            #pragma omp parallel for num_threads(nthreads)
+            #endif
+            for (int tid = 0; tid < nthreads; ++tid) {
+                std::memcpy(cmpDataPos + offsets[tid], blocks[tid].get(), block_sizes[tid]);
+            }
+            cmpDataPos += payload_size;
+        }
 #ifdef Falcons_PRINT_TIMINGS
         timer.stop("cmp all lossless");
 #endif
@@ -201,84 +155,108 @@ class FalconsGenericCompressor_OMP : public concepts::CompressorInterface<T> {
     }
 
     T *decompress(const Config &conf, uchar const *cmpData, size_t cmpSize, T *decData) override {
+        TemporaryStorageGuard cleanup{decomposition};
 #ifdef Falcons_PRINT_TIMINGS
         Timer timer(true);
 #endif
+        if (!cmpData || cmpSize < sizeof(int))
+            throw std::invalid_argument("Truncated OpenMP compression header");
         auto cmpDataPos = cmpData;
         int compression_thread_num = 0;
-
-
-        //lossless.decompress(cmpData, cmpSize, buffer, bufferSize);
-        // read(huffSize, cmpDataPos);
-        read(compression_thread_num, cmpDataPos);
-        int16_t** local_quant_inds = new int16_t*[compression_thread_num];
-        int* local_quant_index = new int[compression_thread_num];
-        decomposition.init_local_unpred(compression_thread_num);
-        if(compression_thread_num <= 1){
-            uchar *buffer = nullptr;
-            size_t bufferSize = 0;
-            size_t offset;
-            read(offset, cmpDataPos);
-            cmpSize -= cmpDataPos - cmpData; 
-            lossless.decompress(cmpDataPos, cmpSize, buffer, bufferSize);
-            size_t quant_inds_size = 0;
-            uchar const *bufferPos = buffer;
-            decomposition.load2(bufferPos, bufferSize);
-            decomposition.load3(bufferPos, bufferSize, 0);
-            read(quant_inds_size, bufferPos);
-            local_quant_index[0] = quant_inds_size;
-            // std::cout << "quant_inds_size: " << quant_inds_size << std::endl;
-            encoder.load(bufferPos, bufferSize);
-            local_quant_inds[0] = encoder.decode(bufferPos, quant_inds_size);
-            encoder.postprocess_decode();
-            // decomposition.decompress(conf, local_quant_inds, decData);
-            // return decData;
+        read(compression_thread_num, cmpDataPos, cmpSize);
+        if (compression_thread_num <= 0 ||
+            static_cast<size_t>(compression_thread_num) > cmpSize / sizeof(size_t))
+            throw std::invalid_argument("Invalid OpenMP compression thread count");
+        if (conf.dims.size() != N) throw std::invalid_argument("Invalid interpolation dimensions");
+        size_t data_count = 1;
+        for (size_t dim : conf.dims) {
+            if (dim == 0) throw std::invalid_argument("Invalid interpolation dimensions");
+            data_count = buffer_bounds::mul(data_count, dim);
         }
-        else{
-            std::vector<size_t>block_byte_offsets(compression_thread_num);
-            std::vector<size_t>output_block_byte_offsets(compression_thread_num);
 
-            read(block_byte_offsets.data(),compression_thread_num,cmpDataPos);
-            cmpSize -= cmpDataPos - cmpData;
-            // #ifdef _OPENMP
-            // #pragma omp parallel for 
-            // #endif
-            // for(int tid=0; tid < compression_thread_num;tid++){
-            #pragma omp parallel num_threads(compression_thread_num)
-            {
-                auto tid = omp_get_thread_num();
-                //size_t start_idx = (static_cast<size_t>(tid) * huffSize) / static_cast<size_t>(compression_thread_num), cur_len = (static_cast<size_t>(tid+1) * huffSize) / static_cast<size_t>(compression_thread_num) - start_idx;
-                size_t block_byte_offset = block_byte_offsets[tid];
-                //std::cout<<tid<<" "<<block_byte_offset<<std::endl;
+        std::vector<size_t> offsets(compression_thread_num);
+        read(offsets.data(), offsets.size(), cmpDataPos, cmpSize);
+        if (offsets[0] != 0) throw std::invalid_argument("Invalid OpenMP block offset");
+        for (int tid = 0; tid < compression_thread_num; ++tid) {
+            if (offsets[tid] >= cmpSize || (tid > 0 && offsets[tid] <= offsets[tid - 1]))
+                throw std::invalid_argument("Invalid OpenMP block offset");
+        }
 
-                size_t block_byte_length = (tid != compression_thread_num-1)? block_byte_offsets[tid + 1] - block_byte_offset : cmpSize - block_byte_offset;
-               // #pragma omp critical
-                //std::cout<<"tid: "<<tid<<", prefix: "<<block_byte_offset<<std::endl;
-                auto temp_cmp_pos = cmpDataPos + block_byte_offset;
-                uchar* cur_buffer = nullptr;
-                size_t cur_bufferSize = 0;
-                lossless.decompress(temp_cmp_pos, block_byte_length, cur_buffer, cur_bufferSize);
-                uchar const* cur_buffer_pos = cur_buffer;
-                if(tid == compression_thread_num - 1)
-                    decomposition.load2(cur_buffer_pos, cur_bufferSize);
-                #pragma omp barrier
-                decomposition.load3(cur_buffer_pos, cur_bufferSize, tid);
-                read<int>(local_quant_index[tid], cur_buffer_pos);
-
-                Encoder cur_encoder;
-                cur_encoder.load(cur_buffer_pos, cur_bufferSize);
-                // std::cout << "Thread " << tid << " encoded size: " << local_quant_index[tid] << std::endl;
-                local_quant_inds[tid] = cur_encoder.decode(cur_buffer_pos, local_quant_index[tid]);
-                cur_encoder.postprocess_decode();
-                free(cur_buffer);
+        struct FreeBuffer { void operator()(uchar *p) const { std::free(p); } };
+        using Buffer = std::unique_ptr<uchar, FreeBuffer>;
+        std::vector<Buffer> buffers(compression_thread_num);
+        std::vector<const uchar *> positions(compression_thread_num);
+        std::vector<size_t> remaining(compression_thread_num);
+        std::vector<std::exception_ptr> errors(compression_thread_num);
+        auto decompress_block = [&](int tid) {
+            const size_t end = tid + 1 < compression_thread_num ? offsets[tid + 1] : cmpSize;
+            uchar *buffer = nullptr;
+            try {
+                lossless.decompress(cmpDataPos + offsets[tid], end - offsets[tid], buffer, remaining[tid]);
+            } catch (...) {
+                std::free(buffer);
+                throw;
             }
+            buffers[tid].reset(buffer);
+            positions[tid] = buffer;
+        };
+        #ifdef _OPENMP
+        #pragma omp parallel for num_threads(compression_thread_num)
+        #endif
+        for (int tid = 0; tid < compression_thread_num; ++tid) {
+            try { decompress_block(tid); }
+            catch (...) { errors[tid] = std::current_exception(); }
+        }
+        for (const auto &error : errors) if (error) std::rethrow_exception(error);
+
+        const int last = compression_thread_num - 1;
+        decomposition.load2(positions[last], remaining[last]);
+        decomposition.init_local_unpred(compression_thread_num);
+        std::vector<std::unique_ptr<int16_t[]>> owned_quant_inds(compression_thread_num);
+        std::vector<int16_t *> local_quant_inds(compression_thread_num, nullptr);
+        auto decode_block = [&](int tid, Encoder &cur_encoder) {
+            decomposition.load3(positions[tid], remaining[tid], tid);
+            size_t quant_count = 0;
+            if (compression_thread_num == 1) {
+                if (remaining[tid] < sizeof(size_t)) throw std::invalid_argument("Truncated quantization count");
+                read(quant_count, positions[tid], remaining[tid]);
+            } else {
+                if (remaining[tid] < sizeof(int)) throw std::invalid_argument("Truncated quantization count");
+                int count = 0;
+                read(count, positions[tid], remaining[tid]);
+                if (count < 0) throw std::invalid_argument("Invalid quantization count");
+                quant_count = static_cast<size_t>(count);
+            }
+            if (quant_count > data_count || quant_count > static_cast<size_t>(std::numeric_limits<int>::max()))
+                throw std::invalid_argument("Invalid quantization count");
+            cur_encoder.load(positions[tid], remaining[tid]);
+            owned_quant_inds[tid].reset(cur_encoder.decode(positions[tid], quant_count));
+            local_quant_inds[tid] = owned_quant_inds[tid].get();
+            cur_encoder.postprocess_decode();
+            buffers[tid].reset();
+        };
+        if (compression_thread_num == 1) {
+            decode_block(0, encoder);
+        } else {
+            #ifdef _OPENMP
+            #pragma omp parallel for num_threads(compression_thread_num)
+            #endif
+            for (int tid = 0; tid < compression_thread_num; ++tid) {
+                try {
+                    Encoder cur_encoder;
+                    decode_block(tid, cur_encoder);
+                } catch (...) {
+                    errors[tid] = std::current_exception();
+                }
+            }
+            for (const auto &error : errors) if (error) std::rethrow_exception(error);
         }
 
 #ifdef Falcons_PRINT_TIMINGS
         timer.stop("decmp all lossless");
         timer.start();
 #endif
-        decomposition.decompress(conf, local_quant_inds, decData);
+        decomposition.decompress(conf, local_quant_inds.data(), decData);
 #ifdef Falcons_PRINT_TIMINGS
     timer.stop("decomp interp");
 #endif
@@ -294,8 +272,8 @@ class FalconsGenericCompressor_OMP : public concepts::CompressorInterface<T> {
 template <class T, uint N, class Decomposition, class Encoder, class Lossless>
 std::shared_ptr<FalconsGenericCompressor_OMP<T, N, Decomposition, Encoder, Lossless>> make_compressor_falcons_generic_omp(
     Decomposition decomposition, Encoder encoder, Lossless lossless) {
-    return std::make_shared<FalconsGenericCompressor_OMP<T, N, Decomposition, Encoder, Lossless>>(decomposition, encoder,
-                                                                                         lossless);
+    return std::make_shared<FalconsGenericCompressor_OMP<T, N, Decomposition, Encoder, Lossless>>(
+        std::move(decomposition), std::move(encoder), std::move(lossless));
 }
 
 }  // namespace Falcons

@@ -2,6 +2,9 @@
 #define Falcons_BLOCKWISE_DECOMPOSITION_HPP
 
 #include <cstring>
+#include <limits>
+#include <stdexcept>
+#include <type_traits>
 
 #include "Decomposition.hpp"
 #include "Falcons/def.hpp"
@@ -14,8 +17,8 @@
 #include "Falcons/utils/Timer.hpp"
 
 namespace Falcons {
-template <class T, uint N, class Predictor, class Quantizer>
-class BlockwiseDecomposition : public concepts::DecompositionInterface<T, int, N> {
+template <class T, uint N, class Predictor, class Quantizer, class QuantIndex = int>
+class BlockwiseDecomposition : public concepts::DecompositionInterface<T, QuantIndex, N> {
    public:
     using Block_iter = typename block_data<T, N>::block_iterator;
 
@@ -23,16 +26,17 @@ class BlockwiseDecomposition : public concepts::DecompositionInterface<T, int, N
         : predictor(predictor), quantizer(quantizer), fallback_predictor(conf.absErrorBound) {
         static_assert(std::is_base_of<concepts::PredictorInterface<T, N>, Predictor>::value,
                       "must implement the Predictor interface");
+        static_assert(std::is_same<QuantIndex, int>::value || std::is_same<QuantIndex, int16_t>::value,
+                      "unsupported blockwise quantization index type");
+        validate_radius();
     }
 
-    std::tuple<int*, uint64_t>  compress(const Config &conf, T *data) override {
+    std::tuple<QuantIndex*, uint64_t> compress(const Config &conf, T *data) override {
         auto data_with_padding = std::make_shared<block_data<T, N>>(data, conf.dims, predictor.get_padding(), true);
         auto block = data_with_padding->block_iter(conf.blockSize);
-        int *quant_inds = new int[conf.num];   // caller owns it (delete[]); same contract as InterpolationDecomposition
+        QuantIndex *quant_inds = new QuantIndex[conf.num];
         uint64_t cnt = 0;
-        const int radius = quantizer.get_out_range().second / 2;   // =32768 by default; bias codes by +radius so
-                                                                   // signed lorenzo codes become non-negative [0,2*radius),
-                                                                   // matching HuffmanEncoder<int>'s [0,1<<16) freq table
+        const int bias = std::is_same<QuantIndex, int16_t>::value ? 0 : quantizer.get_out_range().second / 2;
         do {
             concepts::PredictorInterface<T, N> *predictor_withfallback = &predictor;
             if (!predictor.precompress(block)) {
@@ -41,17 +45,17 @@ class BlockwiseDecomposition : public concepts::DecompositionInterface<T, int, N
             predictor_withfallback->precompress_block_commit();
             Block_iter::foreach (block, [&](T *c, const std::array<size_t, N> &index) {
                 T pred = predictor_withfallback->predict(block, c, index);
-                quant_inds[cnt++] = quantizer.quantize_and_overwrite(*c, pred) + radius;   // +radius bias (escape -radius -> 0)
+                quant_inds[cnt++] = static_cast<QuantIndex>(quantizer.quantize_and_overwrite(*c, pred) + bias);
             });
 
         } while (block.next());
         return {quant_inds, cnt};
     }
 
-    T *decompress(const Config &conf, int* quant_inds, T *dec_data) override {
-        int *quant_inds_pos = quant_inds;
-        const int radius = quantizer.get_out_range().second / 2;   // un-bias: stored code - radius -> signed code
-                                                                   // (escape 0 -> -radius, triggers recover_unpred)
+    T *decompress(const Config &conf, QuantIndex *quant_inds, T *dec_data) override {
+        validate_radius();
+        QuantIndex *quant_inds_pos = quant_inds;
+        const int bias = std::is_same<QuantIndex, int16_t>::value ? 0 : quantizer.get_out_range().second / 2;
 
         auto data_with_padding =
             std::make_shared<block_data<T, N>>(dec_data, conf.dims, predictor.get_padding(), false);
@@ -63,7 +67,7 @@ class BlockwiseDecomposition : public concepts::DecompositionInterface<T, int, N
             }
             Block_iter::foreach (block, [&](T *c, const std::array<size_t, N> &index) {
                 T pred = predictor_withfallback->predict(block, c, index);
-                *c = quantizer.recover(pred, *(quant_inds_pos++) - radius);   // -radius un-bias
+                *c = quantizer.recover(pred, static_cast<int>(*(quant_inds_pos++)) - bias);
             });
 
         } while (block.next());
@@ -86,15 +90,23 @@ class BlockwiseDecomposition : public concepts::DecompositionInterface<T, int, N
     std::pair<int, int> get_out_range() override { return quantizer.get_out_range(); }
 
    private:
+    void validate_radius() const {
+        if constexpr (std::is_same<QuantIndex, int16_t>::value) {
+            const int radius = quantizer.get_out_range().second / 2;
+            if (radius < 1 || radius > static_cast<int>((std::numeric_limits<int16_t>::max)()) + 1)
+                throw std::invalid_argument("blockwise quantization radius exceeds int16 range");
+        }
+    }
+
     Predictor predictor;
     Quantizer quantizer;
     LorenzoPredictor<T, N, 1> fallback_predictor;
 };
 
-template <class T, uint N, class Predictor, class Quantizer>
-BlockwiseDecomposition<T, N, Predictor, Quantizer> make_decomposition_blockwise(const Config &conf, Predictor predictor,
-                                                                                Quantizer quantizer) {
-    return BlockwiseDecomposition<T, N, Predictor, Quantizer>(conf, predictor, quantizer);
+template <class T, uint N, class QuantIndex = int, class Predictor, class Quantizer>
+BlockwiseDecomposition<T, N, Predictor, Quantizer, QuantIndex> make_decomposition_blockwise(
+    const Config &conf, Predictor predictor, Quantizer quantizer) {
+    return BlockwiseDecomposition<T, N, Predictor, Quantizer, QuantIndex>(conf, predictor, quantizer);
 }
 
 }  // namespace Falcons

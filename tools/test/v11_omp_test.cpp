@@ -48,6 +48,14 @@ namespace {
 template <class T, unsigned N = 3>
 using Decomp = Falcons::InterpolationDecomposition_OMP<T, N, Falcons::LinearQuantizerOMP<T>>;
 using Bytes = std::vector<unsigned char>;
+static_assert(!std::is_copy_constructible_v<Falcons::LinearQuantizerOMP<float>>);
+static_assert(!std::is_copy_assignable_v<Falcons::LinearQuantizerOMP<float>>);
+static_assert(std::is_move_constructible_v<Falcons::LinearQuantizerOMP<float>>);
+static_assert(std::is_move_assignable_v<Falcons::LinearQuantizerOMP<float>>);
+static_assert(!std::is_copy_constructible_v<Decomp<float, 1>>);
+static_assert(!std::is_copy_assignable_v<Decomp<float, 1>>);
+static_assert(std::is_move_constructible_v<Decomp<float, 1>>);
+static_assert(std::is_move_assignable_v<Decomp<float, 1>>);
 size_t checks = 0;
 size_t cases = 0;
 std::string context;
@@ -212,6 +220,7 @@ void release_compression(Decomp<T, N> &d) {
     ::operator delete[](d.quantizer.unpred_vec, std::align_val_t(64));
     delete[] d.quantizer.local_unpred;
     delete[] d.quantizer.local_unpred_idx;
+    d.release_temporary_storage();
 }
 
 template <class T, unsigned N>
@@ -286,7 +295,6 @@ void roundtrip(const std::array<size_t, N> &dims, int algo, int direction,
     decoder.init_local_unpred(static_cast<int>(threads));
     std::vector<int16_t *> pointers(threads);
     for (size_t tid = 0; tid < threads; ++tid) {
-        decoder.quantizer.local_unpred[tid] = nullptr;
         cursor = unpred[tid].data();
         remaining = unpred[tid].size();
         decoder.load3(cursor, remaining, static_cast<int>(tid));
@@ -298,16 +306,61 @@ void roundtrip(const std::array<size_t, N> &dims, int algo, int direction,
     for (size_t tid = 0; tid < threads; ++tid) {
         require(decoder.local_quant_index[tid].value == code_counts[tid], "per-thread code cursor");
         require(decoder.quantizer.local_unpred_idx[tid].value == unpred_counts[tid], "per-thread outlier cursor");
-        delete[] decoder.quantizer.local_unpred[tid];
     }
-    delete[] decoder.local_quant_index;
-    ::operator delete[](decoder.quantizer.unpred_vec, std::align_val_t(64));
-    delete[] decoder.quantizer.local_unpred;
-    delete[] decoder.quantizer.local_unpred_idx;
+    decoder.release_temporary_storage();
+    for (size_t tid = 0; tid < threads; ++tid)
+        require(pointers[tid] == codes[tid].data(), "decoded quantization codes remain borrowed");
     for (size_t i = 0; i < recovered.size(); ++i) {
         require_reconstruction(i, original[i], data[i], recovered[i], conf.absErrorBound);
     }
     ++cases;
+}
+
+void ownership_checks() {
+    context = "OMP decompression ownership";
+    Falcons::Config conf(129);
+    conf.cmprAlgo = Falcons::ALGO_INTERP;
+    conf.interpAnchorStride = 0;
+    conf.absErrorBound = 0.001;
+    Decomp<float, 1> decoder(conf, Falcons::LinearQuantizerOMP<float>(conf.absErrorBound));
+    decoder.init_local_unpred(1);
+    unsigned char serialized[sizeof(int) + 2 * sizeof(float)];
+    auto *out = serialized;
+    Falcons::write<int>(2, out);
+    Falcons::write<float>(42.0f, out);
+    Falcons::write<float>(84.0f, out);
+    const auto *in = serialized;
+    size_t remaining = sizeof(serialized);
+    decoder.load3(in, remaining, 0);
+    require(decoder.quantizer.local_unpred[0] != nullptr, "decoded outlier allocated");
+    require(decoder.quantizer.recover_unpred2(0) == 42.0f, "first outlier recovered");
+    auto *const old_outliers = decoder.quantizer.local_unpred[0];
+    const int old_cursor = decoder.quantizer.local_unpred_idx[0].value;
+    unsigned char truncated[sizeof(int) + sizeof(float)];
+    out = truncated;
+    Falcons::write<int>(2, out);
+    Falcons::write<float>(-1.0f, out);
+    const auto *truncated_in = truncated;
+    size_t truncated_remaining = sizeof(truncated);
+    bool rejected = false;
+    try { decoder.load3(truncated_in, truncated_remaining, 0); }
+    catch (const std::invalid_argument &) { rejected = true; }
+    require(rejected && decoder.quantizer.local_unpred[0] == old_outliers &&
+            decoder.quantizer.decoded_unpred_owner[0].get() == old_outliers &&
+            decoder.quantizer.local_unpred_idx[0].value == old_cursor,
+            "truncated reload preserves outlier state");
+    require(truncated_in == truncated && truncated_remaining == sizeof(truncated),
+            "truncated reload preserves input cursor");
+    require(decoder.quantizer.recover_unpred2(0) == 84.0f,
+            "old outliers remain usable after truncated reload");
+    int16_t code = 7;
+    int16_t *borrowed = &code;
+    rejected = false;
+    try { decoder.decompress(conf, &borrowed, nullptr); }
+    catch (const std::invalid_argument &) { rejected = true; }
+    require(rejected && !decoder.quantizer.local_unpred && !decoder.local_quant_index,
+            "failed decompression releases outliers and cursors");
+    require(borrowed == &code && code == 7, "failure does not free borrowed codes");
 }
 
 #ifdef __AVX2__
@@ -387,6 +440,7 @@ int main(int argc, char **argv) {
             if (only_threads && only_threads != threads) continue;
             omp_set_num_threads(threads);
             partition_checks(threads);
+            ownership_checks();
             for (int algo : {0, 1}) {
                 for (int direction : {0, 1, 2, 3, 4, 5}) {
                     roundtrip<float, 3>({33, 35, 67}, algo, direction, 0, 0);

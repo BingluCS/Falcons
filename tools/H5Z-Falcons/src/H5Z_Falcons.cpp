@@ -1,8 +1,11 @@
 #include "H5Z_Falcons.hpp"
 
+#include <cstdlib>
+#include <exception>
 #include <fstream>
 #include <iterator>
 #include <memory>
+#include <new>
 
 
 hid_t H5Z_Falcons_ERRCLASS = -1;
@@ -152,20 +155,25 @@ static herr_t H5Z_falcons_set_local(hid_t dcpl_id, hid_t type_id, hid_t chunk_sp
 }
 
 template <typename T>
-void process_data(Falcons::Config& conf, void** buf, size_t* buf_size, size_t nbytes, bool is_decompress) {
+size_t process_data(Falcons::Config& conf, void** buf, size_t* buf_size, size_t nbytes, bool is_decompress) {
+    const size_t capacity = is_decompress
+        ? Falcons::buffer_bounds::mul(conf.num, sizeof(T))
+        : Falcons::Falcons_compress_size_bound<T>(conf);
+    std::unique_ptr<void, decltype(&std::free)> output(std::malloc(capacity), &std::free);
+    if (!output) throw std::bad_alloc();
+
+    size_t output_size;
     if (is_decompress) {
-        T* processedData = static_cast<T*>(malloc(conf.num * sizeof(T)));
-        Falcons_decompress(conf, static_cast<char*>(*buf), nbytes, processedData);
-        free(*buf);
-        *buf = processedData;
-        *buf_size = conf.num * sizeof(T);
+        T* decoded = static_cast<T*>(output.get());
+        Falcons_decompress(conf, static_cast<char*>(*buf), nbytes, decoded, capacity / sizeof(T));
+        output_size = Falcons::buffer_bounds::mul(conf.num, sizeof(T));
     } else {
-        size_t cmpCap = sizeof(T) * conf.num * 2;
-        char* cmpData = static_cast<char*>(malloc(cmpCap));
-        *buf_size = Falcons_compress(conf, static_cast<T*>(*buf), cmpData, cmpCap);
-        free(*buf);
-        *buf = cmpData;
+        output_size = Falcons_compress(conf, static_cast<T*>(*buf), static_cast<char*>(output.get()), capacity);
     }
+    std::free(*buf);
+    *buf = output.release();
+    *buf_size = capacity;
+    return output_size;
 }
 
 /**
@@ -184,51 +192,45 @@ static size_t H5Z_filter_falcons(unsigned int flags, size_t cd_nelmts, const uns
     if (cd_nelmts == 0) // this is special data such as string, which should not be treated as values.
         return nbytes;
 
-    Falcons::Config conf;
+    try {
+        Falcons::Config conf;
+        auto buffer = reinterpret_cast<const unsigned char*>(cd_values);
+        conf.load(buffer);
+        if (conf.num < 20) return nbytes;
 
-    auto buffer = reinterpret_cast<const unsigned char*>(cd_values);
-    conf.load(buffer);
-    //    conf.print();
-
-    if (conf.num < 20) return nbytes;
-
-    bool is_decompress = flags & H5Z_FLAG_REVERSE;
-    switch (conf.dataType) {
+        bool is_decompress = flags & H5Z_FLAG_REVERSE;
+        switch (conf.dataType) {
         case Falcons_FLOAT:
-            process_data<float>(conf, buf, buf_size, nbytes, is_decompress);
-            break;
+            return process_data<float>(conf, buf, buf_size, nbytes, is_decompress);
 #if (!Falcons_DEBUG_TIMINGS)
         case Falcons_DOUBLE:
-            process_data<double>(conf, buf, buf_size, nbytes, is_decompress);
-            break;
+            return process_data<double>(conf, buf, buf_size, nbytes, is_decompress);
         case Falcons_INT8:
-            process_data<int8_t>(conf, buf, buf_size, nbytes, is_decompress);
-            break;
+            return process_data<int8_t>(conf, buf, buf_size, nbytes, is_decompress);
         case Falcons_UINT8:
-            process_data<uint8_t>(conf, buf, buf_size, nbytes, is_decompress);
-            break;
+            return process_data<uint8_t>(conf, buf, buf_size, nbytes, is_decompress);
         case Falcons_INT16:
-            process_data<int16_t>(conf, buf, buf_size, nbytes, is_decompress);
-            break;
+            return process_data<int16_t>(conf, buf, buf_size, nbytes, is_decompress);
         case Falcons_UINT16:
-            process_data<uint16_t>(conf, buf, buf_size, nbytes, is_decompress);
-            break;
+            return process_data<uint16_t>(conf, buf, buf_size, nbytes, is_decompress);
         case Falcons_INT32:
-            process_data<int32_t>(conf, buf, buf_size, nbytes, is_decompress);
-            break;
+            return process_data<int32_t>(conf, buf, buf_size, nbytes, is_decompress);
         case Falcons_UINT32:
-            process_data<uint32_t>(conf, buf, buf_size, nbytes, is_decompress);
-            break;
+            return process_data<uint32_t>(conf, buf, buf_size, nbytes, is_decompress);
         case Falcons_INT64:
-            process_data<int64_t>(conf, buf, buf_size, nbytes, is_decompress);
-            break;
+            return process_data<int64_t>(conf, buf, buf_size, nbytes, is_decompress);
         case Falcons_UINT64:
-            process_data<uint64_t>(conf, buf, buf_size, nbytes, is_decompress);
-            break;
+            return process_data<uint64_t>(conf, buf, buf_size, nbytes, is_decompress);
 #endif
         default:
-            std::cerr << (is_decompress ? "Decompression" : "Compression") << " Error: Unknown Datatype" << std::endl;
-            std::exit(EXIT_FAILURE);
+            std::fprintf(stderr, "Falcons HDF5 filter: unsupported datatype\n");
+            return 0;
+        }
+    } catch (const std::exception& e) {
+        std::fprintf(stderr, "Falcons HDF5 filter: %s\n", e.what());
+        return 0;
+    } catch (...) {
+        std::fprintf(stderr, "Falcons HDF5 filter: unknown failure\n");
+        return 0;
     }
-    return *buf_size;
 }

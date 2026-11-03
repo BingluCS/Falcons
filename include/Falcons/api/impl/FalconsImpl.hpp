@@ -12,6 +12,7 @@
 #include "Falcons/api/impl/FalconsDispatcher.hpp"
 #include "Falcons/api/impl/FalconsImplOMP.hpp"
 #include "Falcons/def.hpp"
+#include "Falcons/utils/BufferBounds.hpp"
 
 namespace Falcons {
 template <class T, uint N>
@@ -42,15 +43,7 @@ void Falcons_decompress_impl(Config &conf, const uchar *cmpData, size_t cmpSize,
 
 template <class T>
 size_t Falcons_compress_size_bound(const Config &conf) {
-    bool omp = conf.openmp;
-#ifndef _OPENMP
-    omp = false;
-#endif
-    if (omp) {
-        return 4096 + Falcons_compress_size_bound_omp<T>(conf);
-    } else {
-        return 4096 + conf.size_est() + ZSTD_compressBound(conf.num * sizeof(T));
-    }
+    return buffer_bounds::compressed_bound<T>(conf.num, conf.size_est());
 }
 
 }  // namespace Falcons

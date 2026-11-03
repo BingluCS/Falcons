@@ -7,6 +7,7 @@
 #include "Falcons/compressor/FalconsGenericCompressor.hpp"
 #include "Falcons/decomposition/BlockwiseDecomposition.hpp"
 #include "Falcons/def.hpp"
+#include "Falcons/encoder/RleFseEncoder.hpp"
 #include "Falcons/lossless/Lossless_zstd.hpp"
 #include "Falcons/predictor/ComposedPredictor.hpp"
 #include "Falcons/predictor/LorenzoPredictor.hpp"
@@ -33,7 +34,7 @@ std::shared_ptr<concepts::CompressorInterface<T>> make_compressor_lorenzo_regres
     if (conf.lorenzo) {
         if (use_single_predictor) {
             return make_compressor_falcons_generic<T, N>(
-                make_decomposition_blockwise<T, N>(conf, LorenzoPredictor<T, N, 1>(conf.absErrorBound), quantizer),
+                make_decomposition_blockwise<T, N, int16_t>(conf, LorenzoPredictor<T, N, 1>(conf.absErrorBound), quantizer),
                 encoder, lossless);
         } else {
             predictors.push_back(std::make_shared<LorenzoPredictor<T, N, 1>>(conf.absErrorBound));
@@ -42,7 +43,7 @@ std::shared_ptr<concepts::CompressorInterface<T>> make_compressor_lorenzo_regres
     if (conf.lorenzo2) {
         if (use_single_predictor) {
             return make_compressor_falcons_generic<T, N>(
-                make_decomposition_blockwise<T, N>(conf, LorenzoPredictor<T, N, 2>(conf.absErrorBound), quantizer),
+                make_decomposition_blockwise<T, N, int16_t>(conf, LorenzoPredictor<T, N, 2>(conf.absErrorBound), quantizer),
                 encoder, lossless);
         } else {
             predictors.push_back(std::make_shared<LorenzoPredictor<T, N, 2>>(conf.absErrorBound));
@@ -51,7 +52,7 @@ std::shared_ptr<concepts::CompressorInterface<T>> make_compressor_lorenzo_regres
     if (conf.regression) {
         if (use_single_predictor) {
             return make_compressor_falcons_generic<T, N>(
-                make_decomposition_blockwise<T, N>(conf, RegressionPredictor<T, N>(conf.blockSize, conf.absErrorBound),
+                make_decomposition_blockwise<T, N, int16_t>(conf, RegressionPredictor<T, N>(conf.blockSize, conf.absErrorBound),
                                                    quantizer),
                 encoder, lossless);
         } else {
@@ -60,7 +61,7 @@ std::shared_ptr<concepts::CompressorInterface<T>> make_compressor_lorenzo_regres
     }
 
     return make_compressor_falcons_generic<T, N>(
-        make_decomposition_blockwise<T, N>(conf, ComposedPredictor<T, N>(predictors), quantizer), encoder, lossless);
+        make_decomposition_blockwise<T, N, int16_t>(conf, ComposedPredictor<T, N>(predictors), quantizer), encoder, lossless);
 }
 
 template <class T, uint N>
@@ -70,7 +71,7 @@ size_t Falcons_compress_LorenzoReg(Config &conf, T *data, uchar *cmpData, size_t
     calAbsErrorBound(conf, data);
 
     auto quantizer = LinearQuantizer<T>(conf.absErrorBound, conf.quantbinCnt / 2);
-    auto falcons = make_compressor_lorenzo_regression<T, N>(conf, quantizer, HuffmanEncoder<int>(), Lossless_zstd());
+    auto falcons = make_compressor_lorenzo_regression<T, N>(conf, quantizer, RleFseEncoder<int16_t>(), Lossless_zstd());
     return falcons->compress(conf, data, cmpData, cmpCap);
 }
 
@@ -79,7 +80,7 @@ void Falcons_decompress_LorenzoReg(const Config &conf, const uchar *cmpData, siz
     assert(conf.cmprAlgo == ALGO_LORENZO_REG);
     auto cmpDataPos = cmpData;
     LinearQuantizer<T> quantizer;
-    auto falcons = make_compressor_lorenzo_regression<T, N>(conf, quantizer, HuffmanEncoder<int>(), Lossless_zstd());
+    auto falcons = make_compressor_lorenzo_regression<T, N>(conf, quantizer, RleFseEncoder<int16_t>(), Lossless_zstd());
     falcons->decompress(conf, cmpDataPos, cmpSize, decData);
 }
 }  // namespace Falcons

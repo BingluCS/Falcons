@@ -1,10 +1,13 @@
 #ifndef Falcons_IMPL_FalconsDISPATCHER_HPP
 #define Falcons_IMPL_FalconsDISPATCHER_HPP
 
+#include <algorithm>
+#include <memory>
 #include "Falcons/api/impl/FalconsAlgoInterp.hpp"
 #include "Falcons/api/impl/FalconsAlgoLorenzoReg.hpp"
 #include "Falcons/api/impl/FalconsAlgoNopred.hpp"
 #include "Falcons/utils/Config.hpp"
+#include "Falcons/utils/BufferBounds.hpp"
 #include "Falcons/utils/Statistic.hpp"
 #include "Falcons/utils/Timer.hpp"
 #ifdef _OPENMP
@@ -15,6 +18,7 @@ namespace Falcons {
 template <class T, uint N>
 size_t Falcons_compress_dispatcher(Config &conf, const T *data, uchar *cmpData, size_t cmpCap) {
     assert(N == conf.N);
+    const size_t inputBytes = buffer_bounds::mul(conf.num, sizeof(T));
 #ifdef Falcons_PRINT_TIMINGS
             Timer timer(true);
 #endif
@@ -114,22 +118,22 @@ calAbsErrorBound(conf, data);
     if (conf.cmprAlgo == ALGO_LOSSLESS || !isCmpCapSufficient) {
         conf.cmprAlgo = ALGO_LOSSLESS;
         auto zstd = Lossless_zstd();
-        return zstd.compress(reinterpret_cast<const uchar *>(data), conf.num * sizeof(T), cmpData, cmpCap);
+        return zstd.compress(reinterpret_cast<const uchar *>(data), inputBytes, cmpData, cmpCap);
     }
 
     // if lossy compression ratio < 3, test if lossless only mode has a better ratio than lossy
-    if (conf.num * sizeof(T) / 1.0 / cmpSize < 3) {
+    if (inputBytes / 1.0 / cmpSize < 3) {
         auto zstd = Lossless_zstd();
-        auto zstdCmpCap = ZSTD_compressBound(conf.num * sizeof(T)) + sizeof(size_t);
-        auto zstdCmpData = static_cast<uchar *>(malloc(zstdCmpCap));
-        size_t zstdCmpSize =
-            zstd.compress(reinterpret_cast<const uchar *>(data), conf.num * sizeof(T), zstdCmpData, zstdCmpCap);
-        if (zstdCmpSize < cmpSize && zstdCmpSize <= cmpCap) {
+        const size_t zstdCmpCap = std::min(cmpSize, cmpCap);
+        std::unique_ptr<uchar[]> zstdCmpData(new uchar[zstdCmpCap]);
+        size_t zstdCmpSize = 0;
+        const bool fits = zstd.compress_bounded_trial(
+            reinterpret_cast<const uchar *>(data), inputBytes, zstdCmpData.get(), zstdCmpCap, zstdCmpSize);
+        if (fits && zstdCmpSize < cmpSize) {
             conf.cmprAlgo = ALGO_LOSSLESS;
-            memcpy(cmpData, zstdCmpData, zstdCmpSize);
+            memcpy(cmpData, zstdCmpData.get(), zstdCmpSize);
             cmpSize = zstdCmpSize;
         }
-        free(zstdCmpData);
     }
     return cmpSize;
 }

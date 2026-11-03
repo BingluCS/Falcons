@@ -4,6 +4,7 @@
 #include <stdexcept>
 #include <cstdlib>
 #include <cstring>
+#include <memory>
 #include <new>
 #include <string>
 
@@ -11,6 +12,7 @@
 #include "Falcons/lossless/Lossless.hpp"
 #include "Falcons/utils/MemoryUtil.hpp"
 #include "zstd.h"
+#include "zstd_errors.h"
 
 namespace Falcons {
 class Lossless_zstd : public concepts::LosslessInterface {
@@ -43,6 +45,55 @@ class Lossless_zstd : public concepts::LosslessInterface {
         if (ZSTD_isError(dstLen))
             throw std::runtime_error(std::string("Zstd compression failed: ") + ZSTD_getErrorName(dstLen));
         return dstLen + sizeof(size_t);
+    }
+
+    bool compress_bounded_trial(const uchar *src, size_t srcLen, uchar *dst, size_t dstCap,
+                                size_t &written) {
+        if (dstCap < sizeof(size_t)) return false;
+        write(srcLen, dst);
+        dstCap -= sizeof(size_t);
+        if (std::getenv("FALCONS_NOZSTD")) {
+            if (srcLen > dstCap) return false;
+            if (srcLen) memcpy(dst, src, srcLen);
+            written = srcLen + sizeof(size_t);
+            return true;
+        }
+        if (!dstCap) return false;
+        std::unique_ptr<ZSTD_CCtx, decltype(&ZSTD_freeCCtx)> ctx(ZSTD_createCCtx(), &ZSTD_freeCCtx);
+        if (!ctx) throw std::bad_alloc();
+        auto check = [](size_t result) {
+            if (ZSTD_isError(result)) throw std::runtime_error(ZSTD_getErrorName(result));
+        };
+        check(ZSTD_CCtx_setParameter(ctx.get(), ZSTD_c_compressionLevel, compression_level));
+        check(ZSTD_CCtx_setPledgedSrcSize(ctx.get(), srcLen));
+        ZSTD_outBuffer out{dst, dstCap, 0};
+        const size_t firstLen = srcLen ? srcLen - 1 : 0;
+        ZSTD_inBuffer in{src, firstLen, 0};
+        auto step = [&](ZSTD_EndDirective directive, size_t &remaining) {
+            const size_t oldIn = in.pos, oldOut = out.pos;
+            remaining = ZSTD_compressStream2(ctx.get(), &out, &in, directive);
+            if (out.pos > out.size || in.pos > in.size) throw std::runtime_error("invalid Zstd stream position");
+            if (ZSTD_isError(remaining)) {
+                if (ZSTD_getErrorCode(remaining) == ZSTD_error_dstSize_tooSmall && out.pos == out.size) return false;
+                throw std::runtime_error(ZSTD_getErrorName(remaining));
+            }
+            if (oldIn == in.pos && oldOut == out.pos && remaining && out.pos < out.size)
+                throw std::runtime_error("Zstd stream made no progress");
+            return true;
+        };
+        size_t remaining = 0;
+        do {
+            if (!step(ZSTD_e_continue, remaining)) return false;
+            if (in.pos < in.size && out.pos == out.size) return false;
+        } while (in.pos < in.size);
+        in = {srcLen ? src + firstLen : src, srcLen - firstLen, 0};
+        do {
+            if (!step(ZSTD_e_end, remaining)) return false;
+            if (remaining && out.pos == out.size) return false;
+        } while (remaining);
+        if (in.pos != in.size) throw std::runtime_error("Zstd stream did not consume its input");
+        written = out.pos + sizeof(size_t);
+        return true;
     }
 
     size_t decompress(const uchar *src, const size_t srcLen, uchar *&dst, size_t &dstLen) override {

@@ -9,7 +9,9 @@
 #ifndef Falcons_COMPRESSOR_TYPE_ONE_HPP
 #define Falcons_COMPRESSOR_TYPE_ONE_HPP
 
+#include <cstdlib>
 #include <cstring>
+#include <memory>
 #ifdef _OPENMP
 #include <omp.h>
 #endif
@@ -19,6 +21,7 @@
 #include "Falcons/encoder/Encoder.hpp"
 #include "Falcons/lossless/Lossless.hpp"
 #include "Falcons/utils/Config.hpp"
+#include "Falcons/utils/BufferBounds.hpp"
 #include "Falcons/utils/FileUtil.hpp"
 #include "Falcons/utils/Timer.hpp"
 #include "Falcons/quantizer/LinearQuantizer.hpp"
@@ -59,6 +62,8 @@ class FalconsGenericCompressor : public concepts::CompressorInterface<T> {
         Timer timer(true);
 #endif
         auto [quant_inds, quant_inds_size] = decomposition.compress(conf, data);
+        using QuantT = std::remove_pointer_t<decltype(quant_inds)>;
+        std::unique_ptr<QuantT[]> quant_owner(quant_inds);
 #ifdef Falcons_PRINT_TIMINGS
         timer.stop("cmp interp");
         timer.start();
@@ -66,7 +71,10 @@ class FalconsGenericCompressor : public concepts::CompressorInterface<T> {
 
         size_t bufferSize = std::max<size_t>(
             1000, 1.2 * (decomposition.size_est() + encoder.size_est_without_init() + sizeof(T) * quant_inds_size));
+        bufferSize = std::max(bufferSize, buffer_bounds::scratch_bound<T>(conf.num, quant_inds_size));
         auto buffer = static_cast<uchar *>(malloc(bufferSize));
+        if (!buffer) throw std::bad_alloc();
+        std::unique_ptr<uchar, decltype(&std::free)> buffer_owner(buffer, &std::free);
         uchar *buffer_pos = buffer;
         auto cmpDataPos = cmpData;
         {
@@ -85,9 +93,9 @@ class FalconsGenericCompressor : public concepts::CompressorInterface<T> {
 
             auto zstdSize = lossless.compress(buffer, currentSize, cmpDataPos, cmpCap);
             cmpDataPos+=zstdSize;
-            free(buffer);
+            buffer_owner.reset();
         }
-        delete[] quant_inds;
+        quant_owner.reset();
 #ifdef Falcons_PRINT_TIMINGS
         timer.stop("cmp zstd");
 #endif
@@ -107,16 +115,21 @@ class FalconsGenericCompressor : public concepts::CompressorInterface<T> {
 
         cmpSize -= cmpDataPos - cmpData; 
         lossless.decompress(cmpDataPos, cmpSize, buffer, bufferSize);
+        std::unique_ptr<uchar, decltype(&std::free)> buffer_owner(buffer, &std::free);
 #ifdef Falcons_PRINT_TIMINGS
         timer.stop("decomp zstd");
         timer.start();
 #endif
         uchar const *bufferPos = buffer;
         decomposition.load(bufferPos, bufferSize);
-        read(quant_inds_size, bufferPos);
+        if (bufferSize < sizeof(quant_inds_size)) throw std::runtime_error("truncated quantization count");
+        read(quant_inds_size, bufferPos, bufferSize);
+        if (quant_inds_size > conf.num) throw std::runtime_error("quant count exceeds data count");
         encoder.load(bufferPos, bufferSize);
         auto quant_inds = encoder.decode(bufferPos, quant_inds_size);
-        free(buffer);
+        using QuantT = std::remove_pointer_t<decltype(quant_inds)>;
+        std::unique_ptr<QuantT[]> quant_owner(quant_inds);
+        buffer_owner.reset();
 #ifdef Falcons_PRINT_TIMINGS
         timer.stop("decomp lossless0");
         timer.start();
@@ -125,7 +138,6 @@ class FalconsGenericCompressor : public concepts::CompressorInterface<T> {
 #ifdef Falcons_PRINT_TIMINGS
     timer.stop("decomp interp");
 #endif
-        delete[] quant_inds;
         return decData;
     }
 

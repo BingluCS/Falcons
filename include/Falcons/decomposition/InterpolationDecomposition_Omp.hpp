@@ -19,12 +19,16 @@
 #include <cstdint>
 #include <cstring>
 #include <limits>
+#include <memory>
+#include <new>
 #include <stdexcept>
 #include <type_traits>
+#include <utility>
 #include "Decomposition.hpp"
 #include "Falcons/def.hpp"
 #include "Falcons/quantizer/Quantizer.hpp"
 #include "Falcons/quantizer/Quantizer_Omp.hpp"
+#include "Falcons/utils/BufferBounds.hpp"
 #include "Falcons/utils/Config.hpp"
 #include "Falcons/utils/FileUtil.hpp"
 #include "Falcons/utils/Interpolators.hpp"
@@ -47,14 +51,67 @@
 namespace Falcons {
 template <class T, uint N, class QuantizerOMP>
 class InterpolationDecomposition_OMP : public concepts::DecompositionInterface_OMP<T, int16_t, N> {
+    struct ScopedInterpolationBuffers {
+        T *&a, *&b, *&c, *&d;
+        std::unique_ptr<T[]> owned_a, owned_b, owned_c, owned_d;
+
+        ScopedInterpolationBuffers(T *&a, T *&b, T *&c, T *&d) : a(a), b(b), c(c), d(d) {}
+        void allocate(size_t count) {
+            owned_a.reset(new T[count]);
+            owned_b.reset(new T[count]);
+            owned_c.reset(new T[count]);
+            owned_d.reset(new T[count]);
+            a = owned_a.get(); b = owned_b.get(); c = owned_c.get(); d = owned_d.get();
+        }
+        ~ScopedInterpolationBuffers() { a = b = c = d = nullptr; }
+    };
+
+    struct CleanupOnFailure {
+        InterpolationDecomposition_OMP &owner;
+        bool committed = false;
+        ~CleanupOnFailure() { if (!committed) owner.release_temporary_storage(); }
+    };
+
+    struct ScopedOmpSettings {
+        int threads = omp_get_max_threads();
+        int dynamic = omp_get_dynamic();
+        ScopedOmpSettings() { omp_set_dynamic(0); }
+        ~ScopedOmpSettings() {
+            omp_set_num_threads(threads);
+            omp_set_dynamic(dynamic);
+        }
+    };
+
+    static int actual_team_size(int requested) {
+        int actual = 1;
+        #pragma omp parallel num_threads(requested)
+        {
+            #pragma omp single
+            {
+                actual = omp_get_num_threads();
+            }
+        }
+        return actual;
+    }
 
     public:
-    InterpolationDecomposition_OMP(const Config &conf, QuantizerOMP quantizer) : quantizer(quantizer) {
+    InterpolationDecomposition_OMP(const Config &conf, QuantizerOMP quantizer) : quantizer(std::move(quantizer)) {
         static_assert(std::is_base_of<concepts::QuantizerOMPInterface<T, int>, QuantizerOMP>::value,
                       "must implement the quantizer interface");
     }
 
+    InterpolationDecomposition_OMP(const InterpolationDecomposition_OMP &) = delete;
+    InterpolationDecomposition_OMP &operator=(const InterpolationDecomposition_OMP &) = delete;
+    InterpolationDecomposition_OMP(InterpolationDecomposition_OMP &&) = default;
+    InterpolationDecomposition_OMP &operator=(InterpolationDecomposition_OMP &&) = default;
+
+    void release_temporary_storage() noexcept {
+        release_quant_storage();
+        quantizer.release_local_unpred();
+    }
+
     T *decompress(const Config &conf, int16_t** local_quant_inds_vec, T *dec_data) override {
+        CleanupOnFailure cleanup{*this};
         if (!dec_data || conf.dims.size() != N ||
             !std::equal(original_dimensions.begin(), original_dimensions.end(), conf.dims.begin())) {
             throw std::invalid_argument("Interpolation dimensions do not match the output buffer");
@@ -64,28 +121,22 @@ class InterpolationDecomposition_OMP : public concepts::DecompositionInterface_O
 #endif
         init();
 
-        auto default_nThreads = omp_get_max_threads();
-        //std::cout<<"max threads: "<<default_nThreads<<std::endl;
+        ScopedOmpSettings omp_settings;
+        if (nThreads == 0 || nThreads > static_cast<size_t>(std::numeric_limits<int>::max()) ||
+            actual_team_size(static_cast<int>(nThreads)) != static_cast<int>(nThreads)) {
+            throw std::runtime_error("Cannot reproduce the compression OpenMP team");
+        }
+        omp_set_num_threads(static_cast<int>(nThreads));
 
-        size_t max_usable_threads = default_nThreads;
-        for (uint i = 1; i < N; ++i)
-            max_usable_threads = std::min(max_usable_threads, original_dimensions[i]);
-        omp_set_num_threads(max_usable_threads);
-
-        nThreads = omp_get_max_threads(); // for safety
-        //std::cout<<"used threads: "<<nThreads<<std::endl;
-
+        ScopedInterpolationBuffers interp_buffers(interp_buffer_1, interp_buffer_2, interp_buffer_3, interp_buffer_4);
         if constexpr (N != 1) {
 #ifdef __ARM_FEATURE_SVE2
             buffer_len = max_dim +  2 * SVE2_parallelism - max_dim % SVE2_parallelism;
 #else
             buffer_len =  (max_dim + 2 * AVX_256_parallelism - max_dim % AVX_256_parallelism);
 #endif
-            size_t total_buffer_len = buffer_len * nThreads;
-            interp_buffer_1 = new T[total_buffer_len];
-            interp_buffer_2 = new T[total_buffer_len];
-            interp_buffer_3 = new T[total_buffer_len];
-            interp_buffer_4 = new T[total_buffer_len];
+            size_t total_buffer_len = buffer_bounds::mul(buffer_len, nThreads);
+            interp_buffers.allocate(total_buffer_len);
         }
 
         // pred_buffer = new T[total_buffer_len];   // [保留] pred_buffer 当前未被读取
@@ -106,7 +157,8 @@ class InterpolationDecomposition_OMP : public concepts::DecompositionInterface_O
         //visited.resize(num_elements);
         // int** local_quant_inds_vec = new int*[nThreads];
         // quantizer.init_local_unpred(nThreads, each_num);
-        CacheLineInt* local_quant_index_vec = new CacheLineInt[nThreads];
+        local_quant_index_owner.reset(new CacheLineInt[nThreads]);
+        CacheLineInt* local_quant_index_vec = local_quant_index_owner.get();
         // auto each_num = (num_elements / nThreads) << 1;
         const bool observe_coarse_workers = coarse_dispatch_candidate();
         int coarse_workers_ok = 1;
@@ -188,20 +240,14 @@ class InterpolationDecomposition_OMP : public concepts::DecompositionInterface_O
         // std::cout << "Decompressed quantization indices: " << local_quant_index[0].value <<std::endl;
 
 
-        if constexpr (N != 1) {
-            delete [] interp_buffer_1;
-            delete [] interp_buffer_2;
-            delete [] interp_buffer_3;
-            delete [] interp_buffer_4;
-        }
         // delete [] pred_buffer;   // [保留] pred_buffer 当前未被读取
 
-        omp_set_num_threads(default_nThreads);
+        cleanup.committed = true;
         return dec_data;
     }
 
-    // compress given the error bound
     std::tuple<int16_t**, CacheLineInt*> compress(const Config &conf, T *data) override {
+        release_temporary_storage();
         if (!data || conf.dims.size() != N) {
             throw std::invalid_argument("Invalid interpolation input dimensions or buffer");
         }
@@ -219,26 +265,22 @@ class InterpolationDecomposition_OMP : public concepts::DecompositionInterface_O
 
         init();
         blocksize = max_dim;
-        auto default_nThreads = omp_get_max_threads();
-        //std::cout<<"max threads: "<<default_nThreads<<std::endl;
-
-        size_t max_usable_threads = default_nThreads;
+        ScopedOmpSettings omp_settings;
+        size_t max_usable_threads = omp_in_parallel() ? 1 : static_cast<size_t>(omp_settings.threads);
+        if constexpr (N == 1) max_usable_threads = std::min(max_usable_threads, original_dimensions[0]);
         for (uint i = 1; i < N; ++i)
             max_usable_threads = std::min(max_usable_threads, original_dimensions[i]);
-        omp_set_num_threads(max_usable_threads);
-
-        nThreads = omp_get_max_threads(); // for safety
+        nThreads = static_cast<size_t>(actual_team_size(static_cast<int>(max_usable_threads)));
+        omp_set_num_threads(static_cast<int>(nThreads));
+        ScopedInterpolationBuffers interp_buffers(interp_buffer_1, interp_buffer_2, interp_buffer_3, interp_buffer_4);
         if constexpr (N != 1) {
 #ifdef __ARM_FEATURE_SVE2
             buffer_len = max_dim +  2 * SVE2_parallelism - max_dim % SVE2_parallelism;
 #else
             buffer_len =  (max_dim + 2 * AVX_256_parallelism - max_dim % AVX_256_parallelism) ; // 32 / sizeof(T);
 #endif
-            size_t total_buffer_len = buffer_len * nThreads;
-            interp_buffer_1 = new T[total_buffer_len];
-            interp_buffer_2 = new T[total_buffer_len];
-            interp_buffer_3 = new T[total_buffer_len];
-            interp_buffer_4 = new T[total_buffer_len];
+            size_t total_buffer_len = buffer_bounds::mul(buffer_len, nThreads);
+            interp_buffers.allocate(total_buffer_len);
         }
 #ifdef Falcons_PRINT_TIMINGS
         timer.stop("init0 time: " );
@@ -256,23 +298,29 @@ class InterpolationDecomposition_OMP : public concepts::DecompositionInterface_O
         int16_t** local_quant_inds_vec = new int16_t*[nThreads];
         CacheLineInt* local_quant_index_vec = new CacheLineInt[nThreads];
 
-        if constexpr (std::is_integral_v<T> || N == 4) {
+        if constexpr (N == 1) {
+            if constexpr (std::is_integral_v<T>) {
+                local_stream_capacity = scalar_stream_capacity();
+            } else {
+#if defined(__AVX2__) || defined(__ARM_FEATURE_SVE2)
+                if constexpr (std::is_same_v<T, float> || std::is_same_v<T, double>)
+                    local_stream_capacity = simd_1d_stream_capacity();
+                else
+                    local_stream_capacity = num_elements;
+#else
+                local_stream_capacity = num_elements;
+#endif
+            }
+        } else if constexpr (std::is_integral_v<T> || N == 4) {
             local_stream_capacity = scalar_stream_capacity();
         } else if constexpr (N == 3) {
             local_stream_capacity = (direction_sequence_id == 0 || direction_sequence_id == 5)
-                ? std::max((num_elements / nThreads) * (nThreads == 1 ? 1 : 4),
+                ? std::max(buffer_bounds::mul(num_elements / nThreads, nThreads == 1 ? 1 : 4),
                            simd_stream_capacity())
                 : scalar_stream_capacity();
         } else if constexpr (N == 2) {
-            local_stream_capacity = std::max((num_elements / nThreads) * (nThreads == 1 ? 1 : 4),
+            local_stream_capacity = std::max(buffer_bounds::mul(num_elements / nThreads, nThreads == 1 ? 1 : 4),
                                              simd_stream_capacity());
-        } else {
-#if !defined(__AVX2__) && !defined(__ARM_FEATURE_SVE2)
-            // The scalar 1D kernel emits its entire stream on the calling thread.
-            local_stream_capacity = num_elements;
-#else
-            local_stream_capacity = (num_elements / nThreads) * (nThreads == 1 ? 1 : 4);
-#endif
         }
         if (local_stream_capacity > static_cast<size_t>(std::numeric_limits<int>::max())) {
             throw std::length_error("OMP per-thread stream exceeds cursor range");
@@ -285,8 +333,11 @@ class InterpolationDecomposition_OMP : public concepts::DecompositionInterface_O
         // +1 extra cacheline of slack per thread: store_quant4/8 write step (up to 8) int16
         // at a time, so the final SIMD store of a region must not overflow into the next
         // thread's region (or past the buffer). Mirrors the serial "+16 padding" on quant_inds.
-        size_t padded_each_num = (((each_num + elems_per_cacheline - 1) / elems_per_cacheline) + 1) * elems_per_cacheline;
-        total_quant_inds = new (std::align_val_t(alignment)) int16_t[nThreads * padded_each_num];
+        size_t padded_each_num = buffer_bounds::mul(
+            buffer_bounds::add(buffer_bounds::add(static_cast<size_t>(each_num), elems_per_cacheline - 1) /
+                               elems_per_cacheline, 1), elems_per_cacheline);
+        total_quant_inds = new (std::align_val_t(alignment))
+            int16_t[buffer_bounds::mul(nThreads, padded_each_num)];
 #if defined(__linux__)
         // THP on this array pays off only when each thread's quant slice is large enough that
         // TLB relief outweighs the huge-page first-touch/setup cost. Measured: the hint wins by
@@ -402,15 +453,8 @@ class InterpolationDecomposition_OMP : public concepts::DecompositionInterface_O
 #endif
         quantizer.set_eb(eb);
         quantizer.postcompress_data();
-        if constexpr (N != 1) {
-            delete [] interp_buffer_1;
-            delete [] interp_buffer_2;
-            delete [] interp_buffer_3;
-            delete [] interp_buffer_4;
-        }
         // delete [] pred_buffer;   // [保留] pred_buffer 当前未被读取
 
-        omp_set_num_threads(default_nThreads);
 #ifdef Falcons_PRINT_TIMINGS
         timer.stop("other: " );
 #endif
@@ -461,6 +505,11 @@ class InterpolationDecomposition_OMP : public concepts::DecompositionInterface_O
     }
 
     void load2(const uchar *&c, size_t &remaining_length) {
+        const size_t header_size = N * sizeof(size_t) + sizeof(blocksize) + sizeof(interp_id) +
+                                   sizeof(direction_sequence_id) + sizeof(anchor_stride) +
+                                   sizeof(eb_alpha) + sizeof(eb_beta);
+        if (remaining_length < header_size)
+            throw std::invalid_argument("Truncated interpolation header");
         read(original_dimensions.data(), N, c, remaining_length);
         read(blocksize, c, remaining_length);
         read(interp_id, c, remaining_length);
@@ -476,12 +525,50 @@ class InterpolationDecomposition_OMP : public concepts::DecompositionInterface_O
     }
 
     void init_local_unpred(int nThreads) {
+        release_quant_storage();
+        if (nThreads <= 0) throw std::invalid_argument("Invalid compression thread count");
+        this->nThreads = static_cast<size_t>(nThreads);
         quantizer.init_local_unpred(nThreads, 0);
     }
+    int compression_thread_count() const { return static_cast<int>(nThreads); }
+    size_t local_unpred_count(int tid) const { return quantizer.local_unpred_count(tid); }
     std::pair<int, int> get_out_range() override { return quantizer.get_out_range(); }
 
    private:
+    void release_quant_storage() noexcept {
+        local_quant_index_owner.reset();
+        total_quant_inds = nullptr;
+        local_quant_inds = nullptr;
+        local_quant_index = nullptr;
+    }
+
     bool coarse_serial_ready = false;
+
+#if defined(__AVX2__) || defined(__ARM_FEATURE_SVE2)
+    size_t simd_1d_stream_capacity() const {
+        if (nThreads == 1) return num_elements;
+#ifdef __ARM_FEATURE_SVE2
+        const size_t lanes = static_cast<size_t>(SVE2_parallelism);
+#else
+        const size_t lanes = AVX_256_parallelism;
+#endif
+        const auto share = [&](size_t count) { return count / nThreads + (count % nThreads != 0); };
+        const size_t slack = buffer_bounds::add(buffer_bounds::mul(2, lanes), 4);
+        size_t capacity = 1;
+        int start_level = interp_level;
+        if (anchor_stride != 0) {
+            capacity = share(1 + (original_dimensions[0] - 1) / anchor_stride);
+            --start_level;
+        }
+        for (int level = start_level; level > 0; --level) {
+            const size_t stride = size_t(1) << (level - 1);
+            const size_t points = (1 + (original_dimensions[0] - 1) / stride) / 2;
+            // A worker gets its static share of vector chunks; thread 0 also gets tails and edges.
+            capacity = buffer_bounds::add(capacity, std::min(points, buffer_bounds::add(share(points), slack)));
+        }
+        return std::min(capacity, num_elements);
+    }
+#endif
 
     size_t scalar_stream_capacity() const {
         const auto share = [&](size_t rows) {
@@ -683,12 +770,14 @@ class InterpolationDecomposition_OMP : public concepts::DecompositionInterface_O
 	    bool use_anchor = false;
         max_dim = 1;
         for (uint i = 0; i < N; ++i) {
+            if (original_dimensions[i] == 0)
+                throw std::invalid_argument("Interpolation dimensions must be nonzero");
             if (interp_level < ceil(log2(original_dimensions[i]))) {
                 interp_level = static_cast<int>(ceil(log2(original_dimensions[i])));
             }
     	    if (original_dimensions[i] > anchor_stride)
     	        use_anchor = true;
-            num_elements *= original_dimensions[i];
+            num_elements = buffer_bounds::mul(num_elements, original_dimensions[i]);
             max_dim = std::max(max_dim,original_dimensions[i]);
         }
 
@@ -3468,7 +3557,7 @@ template <COMPMODE CompMode, bool SkipOverwrite, class QuantizeFunc>
         }
         size_t stride = math_stride * original_dim_offsets[0];
         size_t cur_ij_offset = begin * original_dim_offsets[0];
-        int tid = omp_get_thread_num();
+        int tid = 0;
         if (interp_func == "linear") {
             interp_linear_and_quantize_1D_line<CompMode, true, SkipOverwrite>(data, n, stride, cur_ij_offset, tid, quantize_func);
         } else {
@@ -3657,15 +3746,15 @@ template <COMPMODE CompMode, bool SkipOverwrite, class QuantizeFunc>
     }
 
     int interp_level = -1;
-    int interp_id;
-    uint blocksize;
+    int interp_id = 0;
+    uint blocksize = 0;
     std::vector<std::string> interpolators = {"linear", "cubic"};
     QuantizerOMP quantizer;
-    size_t num_elements;
-    std::array<size_t, N> original_dimensions;
-    std::array<size_t, N> original_dim_offsets;
+    size_t num_elements = 0;
+    std::array<size_t, N> original_dimensions{};
+    std::array<size_t, N> original_dim_offsets{};
     std::vector<std::array<int, N>> dim_sequences;
-    int direction_sequence_id;
+    int direction_sequence_id = 0;
     size_t anchor_stride = 0;
 
     int radius = 32768;
@@ -3688,30 +3777,31 @@ template <COMPMODE CompMode, bool SkipOverwrite, class QuantizeFunc>
     T *pred_buffer = nullptr;
     // std::vector<std::vector<int>> local_quant_inds;
 
-    int16_t* total_quant_inds;
-    int16_t** local_quant_inds;
-    CacheLineInt* local_quant_index;
+    int16_t* total_quant_inds = nullptr;
+    int16_t** local_quant_inds = nullptr;
+    CacheLineInt* local_quant_index = nullptr;
+    std::unique_ptr<CacheLineInt[]> local_quant_index_owner;
     size_t local_stream_capacity = 0;
 #ifdef __AVX2__
     // for avx
-    __m256d radius_avx;
-    __m256d nradius_avx;
-    __m256d zero_avx_d;
-    __m256d ebx2_r_avx;
-    __m256d ebx2_avx;
+    __m256d radius_avx{};
+    __m256d nradius_avx{};
+    __m256d zero_avx_d{};
+    __m256d ebx2_r_avx{};
+    __m256d ebx2_avx{};
 
     // for float
-    __m256 rel_eb_avx_f;
-    __m256 nrel_eb_avx_f;
+    __m256 rel_eb_avx_f{};
+    __m256 nrel_eb_avx_f{};
 
-    __m256 nradius_avx_f;
+    __m256 nradius_avx_f{};
 
     // for double
-    __m256d rel_eb_avx_d;
-    __m256d nrel_eb_avx_d;
+    __m256d rel_eb_avx_d{};
+    __m256d nrel_eb_avx_d{};
 #endif
 #ifdef __ARM_FEATURE_SVE2
-    int SVE2_parallelism;
+    int SVE2_parallelism = 0;
 #endif
     //std::vector<size_t> level_prefix;
     //std::vector<std::array<size_t,N> >reduced_dim_offsets;
@@ -3721,7 +3811,7 @@ template <COMPMODE CompMode, bool SkipOverwrite, class QuantizeFunc>
 
 template <class T, uint N, class QuantizerOMP>
 InterpolationDecomposition_OMP<T, N, QuantizerOMP> make_decomposition_interpolation_omp(const Config &conf, QuantizerOMP quantizer) {
-    return  InterpolationDecomposition_OMP<T, N, QuantizerOMP>(conf, quantizer);
+    return  InterpolationDecomposition_OMP<T, N, QuantizerOMP>(conf, std::move(quantizer));
 }
 
 }  // namespace Falcons

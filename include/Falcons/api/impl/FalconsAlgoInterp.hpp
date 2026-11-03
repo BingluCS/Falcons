@@ -16,6 +16,7 @@
 #endif
 
 #include <cstdlib>
+#include <limits>
 #include <memory>
 #include "Falcons/encoder/RleFseEncoder.hpp"
 #include "Falcons/api/impl/FalconsAlgoLorenzoReg.hpp"
@@ -24,6 +25,7 @@
 #include "Falcons/lossless/Lossless_zstd.hpp"
 #include "Falcons/quantizer/LinearQuantizer.hpp"
 #include "Falcons/utils/Config.hpp"
+#include "Falcons/utils/BufferBounds.hpp"
 #include "Falcons/utils/Extraction.hpp"
 #include "Falcons/utils/QuantOptimizatioin.hpp"
 #include "Falcons/utils/Sample.hpp"
@@ -55,11 +57,13 @@ size_t Falcons_compress_Interp(Config &conf, T *data, uchar *cmpData, size_t cmp
         RleFseEncoder<int16_t>(),  Lossless_zstd());
         return falcons->compress(conf, data, cmpData, cmpCap);
     }
-    else {auto falcons = make_compressor_falcons_generic<T, N>(
+    else {conf.openmp = false;
+    auto falcons = make_compressor_falcons_generic<T, N>(
         make_decomposition_interpolation<TUNING::DISABLED, T, N>(conf, LinearQuantizer<T>(conf.absErrorBound, conf.quantbinCnt / 2)),
         RleFseEncoder<int16_t>(), Lossless_zstd());
     return falcons->compress(conf, data, cmpData, cmpCap);}
     #else
+        conf.openmp = false;
         auto falcons = make_compressor_falcons_generic<T, N>(
         make_decomposition_interpolation<TUNING::DISABLED, T, N>(conf, LinearQuantizer<T>(conf.absErrorBound, conf.quantbinCnt / 2)),
         RleFseEncoder<int16_t>(), Lossless_zstd());
@@ -75,8 +79,7 @@ void Falcons_decompress_Interp(const Config &conf, const uchar *cmpData, size_t 
     auto cmpDataPos = cmpData;
    // std::cout<<"decomp started"<<std::endl;
     #ifdef _OPENMP
-    int threads = omp_get_max_threads();
-    if (threads > 1 && conf.openmp) {
+    if (conf.openmp) {
     auto falcons = make_compressor_falcons_generic_omp<T, N>(
         make_decomposition_interpolation_omp<T, N>(conf, LinearQuantizerOMP<T>(conf.absErrorBound, conf.quantbinCnt / 2)),
         RleFseEncoder<int16_t>(), Lossless_zstd());
@@ -89,12 +92,42 @@ void Falcons_decompress_Interp(const Config &conf, const uchar *cmpData, size_t 
          falcons->decompress(conf, cmpDataPos, cmpSize, decData);
     }
     #else
+    if (conf.openmp) throw std::runtime_error("OpenMP is required to decompress this stream");
     auto falcons = make_compressor_falcons_generic<T, N>(
         make_decomposition_interpolation<TUNING::DISABLED, T, N>(conf, LinearQuantizer<T>(conf.absErrorBound, conf.quantbinCnt / 2)),
         RleFseEncoder<int16_t>(), Lossless_zstd());
          falcons->decompress(conf, cmpDataPos, cmpSize, decData);
     #endif
    
+}
+
+template <class T>
+size_t sample_compress_1d(const uchar *input, size_t unpred_bytes, size_t quant_count,
+                          int state_count, uchar *cmp_data, size_t cmp_cap) {
+    std::vector<int16_t> quant(quant_count);
+    if (quant_count) memcpy(quant.data(), input + unpred_bytes, quant_count * sizeof(int16_t));
+    const size_t capacity = buffer_bounds::scratch_bound<T>(unpred_bytes / sizeof(T), quant_count);
+    std::unique_ptr<uchar[]> buffer(new uchar[capacity]);
+    uchar *pos = buffer.get();
+    if (unpred_bytes) memcpy(pos, input, unpred_bytes);
+    pos += unpred_bytes;
+    write<uint64_t>(static_cast<uint64_t>(quant_count), pos);
+    RleFseEncoder<int16_t> encoder;
+    encoder.preprocess_encode(quant.data(), quant_count, state_count);
+    encoder.save(pos);
+    encoder.encode(quant.data(), quant_count, pos);
+    encoder.postprocess_encode();
+    const size_t size = static_cast<size_t>(pos - buffer.get());
+    const size_t zstd_bound = ZSTD_compressBound(size);
+    if (ZSTD_isError(zstd_bound)) throw std::length_error("tuning Zstd capacity overflow");
+    const size_t required = buffer_bounds::add(sizeof(size_t), zstd_bound);
+    std::unique_ptr<uchar[]> temporary;
+    if (!cmp_data || cmp_cap < required) {
+        cmp_cap = required;
+        temporary.reset(new uchar[cmp_cap]);
+        cmp_data = temporary.get();
+    }
+    return Lossless_zstd().compress(buffer.get(), size, cmp_data, cmp_cap);
 }
 
 template <class T, uint N>
@@ -139,13 +172,19 @@ double interp_compress_test(
         if (bytes != 0) memcpy(buffer.get() + offset, unpred_vec[k].data(), bytes);
         offset += bytes;
     }
+    const size_t unpred_bytes = offset;
     for (size_t k = 0; k < sample_size; ++k) {
         size_t bytes = quant_inds_size[k] * sizeof(int16_t);
         if (bytes != 0) memcpy(buffer.get() + offset, quant_inds[k].get(), bytes);
         offset += bytes;
     }
-    auto lossless = Lossless_zstd();
-    auto cmpSize = lossless.compress(buffer.get(), cur_size, cmpData, cmpCap);
+    size_t cmpSize;
+    if constexpr (N == 1) {
+        cmpSize = sample_compress_1d<T>(buffer.get(), unpred_bytes,
+            (cur_size - unpred_bytes) / sizeof(int16_t), conf.quantbinCnt, cmpData, cmpCap);
+    } else {
+        cmpSize = Lossless_zstd().compress(buffer.get(), cur_size, cmpData, cmpCap);
+    }
 
     auto compression_ratio = conf.num * sampled_blocks.size() * sizeof(T) * 1.0 / cmpSize;
     
@@ -214,6 +253,7 @@ void interp_compress_test_batch(
                 if (bytes != 0) memcpy(buffer.get() + offset, unpred_vec[base + k].data(), bytes);
                 offset += bytes;
             }
+            const size_t unpred_bytes = offset;
             for (size_t k = 0; k < B; ++k) {
                 size_t bytes = quant_inds_size[base + k] * sizeof(int16_t);
                 if (bytes != 0) memcpy(buffer.get() + offset, quant_inds[base + k].get(), bytes);
@@ -224,8 +264,13 @@ void interp_compress_test_batch(
                 cmpData.reset(new uchar[cmpCap]);
                 cmp_capacity = cmpCap;
             }
-            auto lossless = Lossless_zstd();
-            auto cmpSize = lossless.compress(buffer.get(), cur_size, cmpData.get(), cmpCap);
+            size_t cmpSize;
+            if constexpr (N == 1) {
+                cmpSize = sample_compress_1d<T>(buffer.get(), unpred_bytes,
+                    (cur_size - unpred_bytes) / sizeof(int16_t), confs[c].quantbinCnt, nullptr, 0);
+            } else {
+                cmpSize = Lossless_zstd().compress(buffer.get(), cur_size, cmpData.get(), cmpCap);
+            }
             ratios_out[c] = confs[c].num * B * sizeof(T) * 1.0 / cmpSize;
         }
     }
@@ -233,46 +278,49 @@ void interp_compress_test_batch(
 
 template <class T, uint N>
 double lorenzo_compress_test(
-    const std::vector<std::vector<T>> sampled_blocks, const Config &conf, uchar *cmpData,
+    const std::vector<std::vector<T>> &sampled_blocks, const Config &conf, uchar *cmpData,
     size_t cmpCap) {  // test lorenzo cmp on a set of sampled data blocks and return the compression ratio
-    std::vector<int> total_quant_bins;
-    // if ((N == 3 && !conf.regression2) || (N == 1 && !conf.regression && !conf.regression2)) {
+    if (sampled_blocks.empty() || conf.num == 0) return 0;
+    const size_t data_count = buffer_bounds::mul(conf.num, sampled_blocks.size());
+    if (data_count > static_cast<size_t>((std::numeric_limits<int>::max)()))
+        throw std::length_error("tuning unpredictable count may exceed int");
+    std::vector<int16_t> total_quant_bins;
+    total_quant_bins.reserve(data_count);
     std::vector<std::shared_ptr<concepts::PredictorInterface<T, N>>> predictors;
     predictors.push_back(std::make_shared<LorenzoPredictor<T, N, 1>>(conf.absErrorBound));
     predictors.push_back(std::make_shared<LorenzoPredictor<T, N, 2>>(conf.absErrorBound));
-    auto falcons = make_decomposition_blockwise<T, N>(conf, ComposedPredictor<T, N>(predictors),
+    auto falcons = make_decomposition_blockwise<T, N, int16_t>(conf, ComposedPredictor<T, N>(predictors),
                                                  LinearQuantizer<T>(conf.absErrorBound, conf.quantbinCnt / 2));
-    // auto falcons = make_decomposition_lorenzo_regression<T, N>(conf, LinearQuantizer<T>(conf.absErrorBound,
-    // conf.quantbinCnt / 2));
     for (size_t k = 0; k < sampled_blocks.size(); k++) {
+        if (sampled_blocks[k].size() != conf.num) throw std::invalid_argument("invalid tuning block size");
         auto cur_block = sampled_blocks[k];
-        // auto (quant_bins) = falcons.compress(conf, cur_block.data());
-        // total_quant_bins.insert(total_quant_bins.end(), quant_bins.begin(),
-        //                         quant_bins.end());  // merge the quant bins. Lossless them together
         auto [quant_bins, quant_bins_size] = falcons.compress(conf, cur_block.data());
-        total_quant_bins.insert(total_quant_bins.end(), quant_bins, quant_bins + quant_bins_size);
-        delete[] quant_bins;   // falcons.compress now returns a new[] array owned by us
+        std::unique_ptr<int16_t[]> owner(quant_bins);
+        if (quant_bins_size > conf.num || (quant_bins_size && !quant_bins))
+            throw std::length_error("invalid tuning quant count");
+        if (quant_bins_size) total_quant_bins.insert(total_quant_bins.end(), quant_bins, quant_bins + quant_bins_size);
     }
-    auto encoder = HuffmanEncoder<int>();
-    auto lossless = Lossless_zstd();
-    encoder.preprocess_encode(total_quant_bins, conf.quantbinCnt);
-    size_t bufferSize = std::max<size_t>(1000, 1.2 * (encoder.size_est() + sizeof(T) * total_quant_bins.size()));
-
-    auto buffer = static_cast<uchar *>(malloc(bufferSize));
-    uchar *buffer_pos = buffer;
+    RleFseEncoder<int16_t> encoder;
+    encoder.preprocess_encode(total_quant_bins.data(), total_quant_bins.size(), falcons.get_out_range().second);
+    const size_t bufferSize = buffer_bounds::scratch_bound<T>(
+        data_count, buffer_bounds::add(total_quant_bins.size(), data_count));
+    std::unique_ptr<uchar[]> buffer(new uchar[bufferSize]);
+    uchar *buffer_pos = buffer.get();
     falcons.save(buffer_pos);
+    write<uint64_t>(static_cast<uint64_t>(total_quant_bins.size()), buffer_pos);
     encoder.save(buffer_pos);
-
-    // store the size of quant_inds is necessary as it is not always equal to conf.num
-    write<size_t>(total_quant_bins.size(), buffer_pos);
-    encoder.encode(total_quant_bins, buffer_pos);
+    encoder.encode(total_quant_bins.data(), total_quant_bins.size(), buffer_pos);
     encoder.postprocess_encode();
-    auto cmpSize = lossless.compress(buffer, buffer_pos - buffer, cmpData, cmpCap);
-    free(buffer);
-    auto compression_ratio = conf.num * sampled_blocks.size() * sizeof(T) * 1.0 / cmpSize;
-    return compression_ratio;
-
-    return 0;
+    const size_t size = static_cast<size_t>(buffer_pos - buffer.get());
+    const size_t required = buffer_bounds::add(sizeof(size_t), ZSTD_compressBound(size));
+    std::unique_ptr<uchar[]> temporary;
+    if (!cmpData || cmpCap < required) {
+        temporary.reset(new uchar[required]);
+        cmpData = temporary.get();
+        cmpCap = required;
+    }
+    const auto cmpSize = Lossless_zstd().compress(buffer.get(), size, cmpData, cmpCap);
+    return static_cast<double>(conf.num) * sampled_blocks.size() * sizeof(T) / cmpSize;
 }
 
 template <class T, uint N>

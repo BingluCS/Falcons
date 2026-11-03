@@ -10,4 +10,9 @@ build_hdf5_test(convertBinToHDF5.cpp)
 build_hdf5_test(cdvalueHelper.cpp)
 set_target_properties(cdvalueHelper PROPERTIES OUTPUT_NAME print_h5repack_args)
 
+if (BUILD_TESTING)
+    build_hdf5_test(HDF5FilterRoundtrip.cpp)
+    add_test(NAME HDF5FilterRoundtrip COMMAND HDF5FilterRoundtrip)
+endif ()
+
 file(COPY ${CMAKE_CURRENT_SOURCE_DIR}/h5repack.sh DESTINATION ${CMAKE_CURRENT_BINARY_DIR})

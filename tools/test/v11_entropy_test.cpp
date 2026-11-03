@@ -370,7 +370,7 @@ void test_type(bool large) {
         for (int pattern : {3, 4}) {
             Options o;
             o.retain = true;
-            o.expect_method = 1;
+            o.expect_method = pattern == 3 ? 2 : 1;
             o.expect_delta = 0;
             round_trip(encoder, values<T>(n, pattern), o);
         }
@@ -397,7 +397,7 @@ void test_type(bool large) {
         }
     }
     Options automatic;
-    automatic.expect_method = 1;
+    automatic.expect_method = 2;
     automatic.expect_delta = 1;
     round_trip(encoder, values<T>(80003, 5), automatic);
     Falcons::RleFseEncoder<T> copied(encoder), assigned;

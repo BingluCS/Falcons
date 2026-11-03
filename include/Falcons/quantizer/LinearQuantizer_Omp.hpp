@@ -14,11 +14,16 @@
 #include <cassert>
 #include <cstring>
 #include <iostream>
+#include <memory>
+#include <new>
+#include <type_traits>
+#include <utility>
 #include <vector>
 
 #include "Falcons/def.hpp"
 #include "Falcons/utils/Config.hpp"
 #include "Falcons/quantizer/Quantizer_Omp.hpp"
+#include "Falcons/utils/BufferBounds.hpp"
 #include "Falcons/utils/MemoryUtil.hpp"
 
 namespace Falcons {
@@ -31,6 +36,11 @@ class LinearQuantizerOMP : public concepts::QuantizerOMPInterface<T, int> {
     LinearQuantizerOMP(double eb, int r = 32768) : error_bound(eb),double_error_bound(2*eb), double_error_bound_reciprocal(0.5 / eb), radius(r) {
         assert(eb != 0);
     }
+
+    LinearQuantizerOMP(const LinearQuantizerOMP &) = delete;
+    LinearQuantizerOMP &operator=(const LinearQuantizerOMP &) = delete;
+    LinearQuantizerOMP(LinearQuantizerOMP &&) = default;
+    LinearQuantizerOMP &operator=(LinearQuantizerOMP &&) = default;
 
     double get_eb() const { return error_bound; }
 
@@ -129,27 +139,43 @@ class LinearQuantizerOMP : public concepts::QuantizerOMPInterface<T, int> {
 
     ALWAYS_INLINE T recover_unpred() { return unpred[index++]; }
     ALWAYS_INLINE T recover_unpred2(int tid) { return local_unpred[tid][local_unpred_idx[tid].value++]; }
+    size_t local_unpred_count(int tid) const { return static_cast<size_t>(local_unpred_idx[tid].value); }
+    void release_local_unpred() noexcept {
+        decoded_unpred_owner.reset();
+        local_unpred_idx_owner.reset();
+        local_unpred_owner.reset();
+        unpred_vec = nullptr;
+        local_unpred = nullptr;
+        local_unpred_idx = nullptr;
+        local_thread_count = 0;
+    }
     ALWAYS_INLINE void init_local_unpred(int thread_count, int each_num) {
         #ifdef _OPENMP
-            // local_unpred = new T*[thread_count];
-            // local_unpred_idx = new CacheLineInt[thread_count];
-            // #pragma omp parallel for
-            // for (int tid = 0; tid < thread_count; ++tid) {
-            //     if(each_num > 0)
-            //         local_unpred[tid] = new T[each_num];
-            //     local_unpred_idx[tid].value = 0;
-            // }
+            static_assert(std::is_trivially_destructible_v<T>, "OMP values must be trivially destructible");
+            if (thread_count <= 0 || each_num < 0)
+                throw std::invalid_argument("Invalid local outlier capacity");
             const size_t alignment = 64;
             const size_t elems_per_cacheline = alignment / sizeof(T);
             size_t padded_each_num =
-                ((each_num + elems_per_cacheline - 1) / elems_per_cacheline) * elems_per_cacheline;
-            unpred_vec = new (std::align_val_t(64)) T[thread_count * padded_each_num];   // size by padded stride (matches tid*padded_each_num offset below)
-            local_unpred = new T*[thread_count];
-            local_unpred_idx = new CacheLineInt[thread_count];
+                buffer_bounds::mul(buffer_bounds::add(static_cast<size_t>(each_num), elems_per_cacheline - 1) /
+                                   elems_per_cacheline, elems_per_cacheline);
+            const size_t total = buffer_bounds::mul(static_cast<size_t>(thread_count), padded_each_num);
+            release_local_unpred();
+            if (each_num > 0) {
+                unpred_vec = new (std::align_val_t(64)) T[total];
+                local_unpred = new T*[thread_count];
+                local_unpred_idx = new CacheLineInt[thread_count];
+            } else {
+                local_unpred_owner.reset(new T*[thread_count]());
+                local_unpred_idx_owner.reset(new CacheLineInt[thread_count]);
+                decoded_unpred_owner.reset(new std::unique_ptr<T[]>[thread_count]);
+                local_unpred = local_unpred_owner.get();
+                local_unpred_idx = local_unpred_idx_owner.get();
+            }
+            local_thread_count = thread_count;
             #pragma omp parallel for
             for (int tid = 0; tid < thread_count; ++tid) {
-                if(each_num > 0)
-                    local_unpred[tid] = unpred_vec + tid * padded_each_num;
+                local_unpred[tid] = each_num > 0 ? unpred_vec + tid * padded_each_num : nullptr;
                 local_unpred_idx[tid].value = 0;
             }
         #endif
@@ -274,6 +300,8 @@ class LinearQuantizerOMP : public concepts::QuantizerOMPInterface<T, int> {
     }
 
     void load2(const unsigned char *&c, size_t &remaining_length) {
+        if (remaining_length < sizeof(uchar) + sizeof(double) + sizeof(int))
+            throw std::invalid_argument("Truncated LinearQuantizer header");
         uchar uid_read;
         read(uid_read, c, remaining_length);
         if (uid_read != uid) {
@@ -295,13 +323,26 @@ class LinearQuantizerOMP : public concepts::QuantizerOMPInterface<T, int> {
     }
 
     void load3(const unsigned char *&c, size_t &remaining_length, int tid) {
-        read(local_unpred_idx[tid].value, c, remaining_length);
-        if (local_unpred_idx[tid].value > 0) {
-            local_unpred[tid] = new T[local_unpred_idx[tid].value];
-            read(local_unpred[tid], local_unpred_idx[tid].value, c, remaining_length);
-            local_unpred_idx[tid].value = 0;
+        if (tid < 0 || tid >= local_thread_count || !decoded_unpred_owner)
+            throw std::invalid_argument("Invalid LinearQuantizer outlier stream");
+        const unsigned char *pos = c;
+        size_t remaining = remaining_length;
+        int count = 0;
+        if (remaining < sizeof(count))
+            throw std::invalid_argument("Truncated LinearQuantizer outlier count");
+        read(count, pos, remaining);
+        if (count < 0 || static_cast<size_t>(count) > remaining / sizeof(T))
+            throw std::invalid_argument("Invalid LinearQuantizer outlier count");
+        std::unique_ptr<T[]> decoded;
+        if (count > 0) {
+            decoded.reset(new T[count]);
+            read(decoded.get(), static_cast<size_t>(count), pos, remaining);
         }
-        // index = 0;
+        decoded_unpred_owner[tid] = std::move(decoded);
+        local_unpred[tid] = decoded_unpred_owner[tid].get();
+        local_unpred_idx[tid].value = 0;
+        c = pos;
+        remaining_length = remaining;
     }
 
     void print() override {
@@ -309,9 +350,13 @@ class LinearQuantizerOMP : public concepts::QuantizerOMPInterface<T, int> {
     }
    private:
     std::vector<T> unpred;
-    T* unpred_vec;
-    T** local_unpred;
-    CacheLineInt* local_unpred_idx;
+    T* unpred_vec = nullptr;
+    T** local_unpred = nullptr;
+    CacheLineInt* local_unpred_idx = nullptr;
+    std::unique_ptr<T*[]> local_unpred_owner;
+    std::unique_ptr<CacheLineInt[]> local_unpred_idx_owner;
+    std::unique_ptr<std::unique_ptr<T[]>[]> decoded_unpred_owner;
+    int local_thread_count = 0;
     std::vector<size_t> unpred_idx;
     size_t index = 0;  // used in decompression only
     uchar uid = 0b11;

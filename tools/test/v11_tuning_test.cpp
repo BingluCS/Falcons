@@ -142,11 +142,27 @@ double score_from_current_symbols(const std::vector<std::vector<T>> &samples, co
     }
     const size_t raw_bytes = unpredictable.size() * sizeof(T);
     const size_t symbol_bytes = symbols.size() * sizeof(int16_t);
-    std::vector<uchar> payload(std::max<size_t>(1, raw_bytes + symbol_bytes));
+    const size_t payload_capacity = N == 1
+        ? Falcons::buffer_bounds::scratch_bound<T>(unpredictable.size(), symbols.size())
+        : std::max<size_t>(1, raw_bytes + symbol_bytes);
+    std::vector<uchar> payload(payload_capacity);
     if (raw_bytes != 0) std::memcpy(payload.data(), unpredictable.data(), raw_bytes);
-    if (symbol_bytes != 0) std::memcpy(payload.data() + raw_bytes, symbols.data(), symbol_bytes);
-    std::vector<uchar> compressed(ZSTD_compressBound(raw_bytes + symbol_bytes));
-    const size_t size = ZSTD_compress(compressed.data(), compressed.size(), payload.data(), raw_bytes + symbol_bytes, 3);
+    size_t payload_size;
+    if constexpr (N == 1) {
+        uchar *pos = payload.data() + raw_bytes;
+        Falcons::write<uint64_t>(symbols.size(), pos);
+        Falcons::RleFseEncoder<int16_t> encoder;
+        encoder.preprocess_encode(symbols.data(), symbols.size(), conf.quantbinCnt);
+        encoder.save(pos);
+        encoder.encode(symbols.data(), symbols.size(), pos);
+        encoder.postprocess_encode();
+        payload_size = static_cast<size_t>(pos - payload.data());
+    } else {
+        if (symbol_bytes != 0) std::memcpy(payload.data() + raw_bytes, symbols.data(), symbol_bytes);
+        payload_size = raw_bytes + symbol_bytes;
+    }
+    std::vector<uchar> compressed(ZSTD_compressBound(payload_size));
+    const size_t size = ZSTD_compress(compressed.data(), compressed.size(), payload.data(), payload_size, 3);
     require(!ZSTD_isError(size), "reference scoring failed");
     return conf.num * samples.size() * sizeof(T) * 1.0 / (sizeof(size_t) + size);
 }
@@ -162,7 +178,7 @@ void check_candidates(bool parallel) {
     base.absErrorBound = 0.001;
     const auto samples = make_samples<T>(base.num);
     const auto saved = samples;
-    const size_t capacity = sizeof(size_t) + ZSTD_compressBound(base.num * samples.size() * (sizeof(T) + sizeof(int16_t)));
+    const size_t capacity = Falcons::buffer_bounds::compressed_bound<T>(base.num * samples.size(), 0);
     std::vector<uchar> compressed(capacity);
     for (int mode = 0; mode < 2; ++mode) {
         base.interpAnchorStride = mode == 0 ? 8 : 0;
@@ -192,13 +208,20 @@ void check_candidates(bool parallel) {
     double empty_ratio = -1;
     Falcons::interp_compress_test_batch<T, N>({}, &base, 1, edge - 1, &empty_ratio);
     require(empty_ratio == 0, "empty samples produced a nonzero ratio");
-    bool rejected = false;
-    try {
-        Falcons::interp_compress_test<T, N>(samples, base, edge - 1, compressed.data(), sizeof(size_t));
-    } catch (const std::length_error &) {
-        rejected = true;
+    if constexpr (N == 1) {
+        const double expected = score_from_current_symbols<T, N>(samples, base);
+        const double actual = Falcons::interp_compress_test<T, N>(
+            samples, base, edge - 1, compressed.data(), sizeof(size_t));
+        require(actual == expected, "undersized 1D scoring buffer changed the score");
+    } else {
+        bool rejected = false;
+        try {
+            Falcons::interp_compress_test<T, N>(samples, base, edge - 1, compressed.data(), sizeof(size_t));
+        } catch (const std::length_error &) {
+            rejected = true;
+        }
+        require(rejected, "undersized scoring buffer was accepted");
     }
-    require(rejected, "undersized scoring buffer was accepted");
 }
 }  // namespace
 

@@ -10,34 +10,17 @@
 #define Falcons_RLE_FSE_ENCODER_HPP
 
 /**
- * RleFseEncoder — run-length + FSE entropy coder replacing Huffman in Falcons-BR2.
- *
- * Falcons interpolation quant streams are extremely peaked: the zero-error code
- * ("mode") covers ~99% of symbols and forms long spatial runs. This coder:
- *
- *   1. SIMD-scans mode runs (AVX2 or SVE2) — work scales with the number
- *      of runs (~1% of N at loose bounds), not with N.
- *   2. Reparametrizes the stream as alternating [run-length L][non-mode value v].
- *   3. Codes L and zigzag(v-mode) each as Elias-gamma: a magnitude-class byte
- *      (FSE-compressed, near-entropy) plus k raw mantissa bits.
- *
- * Unlike a plain order-0 coder (FSE/ANS), the explicit run capture models the
- * run structure (order-1), so it matches/beats Huffman+zstd on ratio; unlike
- * the adaptive binary range coder, it uses fast static FSE table coding, so it
- * is faster than both. The downstream zstd stage is kept (near-neutral here).
- *
- * Hybrid: when p(mode) < PMODE_MIN the runs degenerate (short) and RLE no longer
- * pays off — fall back to ADT-FSE (Int2code transcode + per-block FSE + bucket-diff
- * bits), which stays fast and near-Huffman on ratio at tight bounds.
- *
- * Only external dependency: FSE_compress/FSE_decompress (exported by the libzstd
- * the pipeline already links). No zstd headers needed.
+ * Adaptive encoding for signed 16-bit quantization codes:
+ * RLE+FSE for sparse codes, conditional tANS for denser codes, and
+ * four-stream byte-split FSE for large streams with many escapes.
+ * The caller applies the final lossless stage separately.
  */
 
 #if defined(__linux__)
 #include <sys/mman.h>
 #endif
 #include <cstring>
+#include <cstddef>
 #include <cstdlib>
 #include <cstdio>
 #include <vector>
@@ -48,6 +31,7 @@
 #include <limits>
 #include <memory>
 #include <new>
+#include <stdexcept>
 
 #ifdef __AVX2__
 #include <immintrin.h>
@@ -62,8 +46,9 @@
 #include "Falcons/utils/MemoryUtil.hpp"
 
 #define FSE_STATIC_LINKING_ONLY
-#include "zfse/fse.h"   // low-level FSE: buildCTable/DTable + inline encodeSymbol/decodeSymbol + BIT stream (zstd 1.4, matches libzstd 1.4.8)
+#include "zfse/fse.h"
 extern "C" {
+#include "zfse/hist.h"
 size_t FSE_buildCTable(FSE_CTable *ct, const short *normalizedCounter, unsigned maxSymbolValue, unsigned tableLog);
 size_t FSE_buildDTable(FSE_DTable *dt, const short *normalizedCounter, unsigned maxSymbolValue, unsigned tableLog);
 }
@@ -74,14 +59,14 @@ template <class T>
 class RleFseEncoder : public concepts::EncoderInterface<T> {
     static_assert(sizeof(T) == 2, "RleFseEncoder expects 16-bit quant codes");
 
-    static constexpr double PMODE_MIN = 0;   // p(mode)>=this -> RLE+FSE (loose); below -> ADT-FSE (tight)
-    // FSE block size: per-block FSE table + raw/RLE fallback (ADT2-FSE). 64K.
+    // FSE blocks use a table or a RAW/RLE fallback, with at most 64K bytes.
     static constexpr int FBLK = 1 << 16;
 
     uint16_t lo_ = 0, mode_ = 0;
-    uint8_t method_ = 0;                         // 0=RLE+FSE 1=tANS 2=RLE+ADT2 3=ADT2
+    uint8_t method_ = 0;                         // 0=RLE+FSE, 1=tANS, 2=byte-split FSE
     bool use_delta_ = false;                     // forward-diff delta (decided by dzeros)
     bool scan_simd_ = true;                      // SIMD in scan_run (decided by p0>=0.85)
+    size_t decode_remaining_ = 0;
 
     // void derive(const T *bins, size_t num_bin, int stateNum) {
     //     (void)stateNum;
@@ -235,160 +220,6 @@ class RleFseEncoder : public concepts::EncoderInterface<T> {
         }
     }
 
-    // ADT transcode (from Falcons_ADT): factor -> 67-code class (FSE) + bucket-diff bits. Finer
-    // than gamma near 0 (each |factor|<=15 is its own FSE symbol), so better at tight bounds.
-    // static constexpr uint8_t Ft_Code[64] = {
-    //     0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,16,17,17,18,18,19,19,
-    //     20,20,20,20,21,21,21,21,22,22,22,22,22,22,22,22,23,23,23,23,23,23,23,23,
-    //     24,24,24,24,24,24,24,24,24,24,24,24,24,24,24,24};
-    // static constexpr int code2int[67][2] = {
-    //     {0,0},{1,0},{2,0},{3,0},{4,0},{5,0},{6,0},{7,0},{8,0},{9,0},{10,0},{11,0},
-    //     {12,0},{13,0},{14,0},{15,0},{16,1},{18,1},{20,1},{22,1},{24,2},{28,2},{32,3},{40,3},
-    //     {48,4},{64,6},{128,7},{256,8},{512,9},{1024,10},{2048,11},{4096,12},{8192,13},{16384,14},
-    //     {-16384,14},{-8192,13},{-4096,12},{-2048,11},{-1024,10},{-512,9},{-256,8},{-128,7},{-64,6},{-48,4},
-    //     {-40,3},{-32,3},{-28,2},{-24,2},{-22,1},{-20,1},{-18,1},{-16,1},{-15,0},{-14,0},{-13,0},{-12,0},
-    //     {-11,0},{-10,0},{-9,0},{-8,0},{-7,0},{-6,0},{-5,0},{-4,0},{-3,0},{-2,0},{-1,0}};
-    // static inline int Int2code(int f) {
-    //     if (f >= 0) return (f > 63) ? 50 - __builtin_clz(f) : Ft_Code[f];
-    //     f = -f; return (f > 63) ? 17 + __builtin_clz(f) : 67 - Ft_Code[f];
-    // }
-    // struct AdtTab { uint8_t t2c[65536]; uint16_t diff[65536]; uint8_t nb[65536]; };
-    // static const AdtTab &adt_tab() {   // precompute over int16 codes once (thread-safe). index = (uint16)code.
-    //     static const AdtTab *t = []() {
-    //         AdtTab *p = new AdtTab();
-    //         for (int u = 0; u < 65536; u++) {
-    //             int factor = (int16_t)u;            // int16 quant code IS the factor (mode = 0)
-    //             if (factor == -32768) continue;     // escape, handled separately
-    //             int c = Int2code(factor);
-    //             p->t2c[u] = (uint8_t)c; int base = code2int[c][0]; int d = factor - base; if (d < 0) d = -d;
-    //             p->diff[u] = (uint16_t)d; p->nb[u] = (uint8_t)code2int[c][1];
-    //         }
-    //         return p;
-    //     }();
-    //     return *t;
-    // }
-
-    // // ADT-FSE path (method_==1): int16 quant code = factor -> Int2code class (FSE) + bucket-diff mantissa.
-    // size_t encode_adt(const T *bins, size_t N, uchar *&bytes) {
-    //     const AdtTab &tab = adt_tab();
-    //     uint8_t *tpc = (uint8_t *)malloc(N), *man = (uint8_t *)malloc(2 * N + 16);
-    //     size_t mbp = 0; uint64_t acc = 0; int an = 0;
-    //     for (size_t i = 0; i < N; i++) {
-    //         int code = (int)bins[i];
-    //         if (code == -32768) { tpc[i] = 67; }            // escape (unpredictable)
-    //         else {
-    //             uint16_t u = (uint16_t)code;                // reinterpret signed code -> table index
-    //             tpc[i] = tab.t2c[u]; int nb = tab.nb[u];
-    //             if (nb) { acc = (acc << nb) | tab.diff[u]; an += nb; while (an >= 8) { an -= 8; man[mbp++] = (uint8_t)(acc >> an); } }
-    //         }
-    //     }
-    //     if (an > 0) man[mbp++] = (uint8_t)(acc << (8 - an));
-    //     uint8_t *o_tpc = (uint8_t *)malloc(N + N / FBLK * 8 + 64);
-    //     size_t s_tpc = fse_enc(tpc, N, o_tpc);
-    //     uchar *start = bytes;
-    //     write((uint64_t)N, bytes); write((uint64_t)s_tpc, bytes); write((uint64_t)mbp, bytes);
-    //     memcpy(bytes, o_tpc, s_tpc); bytes += s_tpc;
-    //     memcpy(bytes, man, mbp);    bytes += mbp;
-    //     free(tpc); free(man); free(o_tpc);
-    //     return (size_t)(bytes - start);
-    // }
-    // T *decode_adt(const uchar *&bytes, size_t N) {
-    //     uint64_t ntp, s_tpc, mbp;
-    //     read(ntp, bytes); read(s_tpc, bytes); read(mbp, bytes);
-    //     const uchar *o_tpc = bytes; bytes += s_tpc;
-    //     const uchar *man = bytes;   bytes += mbp;
-    //     uint8_t *dtpc = (uint8_t *)malloc(ntp ? ntp : 1);
-    //     fse_dec(o_tpc, ntp, dtpc);
-    //     constexpr size_t pad = 64 / sizeof(T);
-    //     T *out = new T[N + pad];
-    //     size_t rp = 0; uint64_t da = 0; int dn = 0;
-    //     for (size_t i = 0; i < N; i++) {
-    //         int c = dtpc[i];
-    //         if (c == 67) { out[i] = (T)(-32768); continue; }   // escape
-    //         int base = code2int[c][0], nb = code2int[c][1], diff = 0;
-    //         if (nb) { while (dn < nb) { da = (da << 8) | man[rp++]; dn += 8; } dn -= nb; diff = (int)((da >> dn) & ((1u << nb) - 1)); }
-    //         int factor = (c < 34) ? base + diff : base - diff;
-    //         out[i] = (T)factor;                                // int16: code = factor (mode = 0)
-    //     }
-    //     free(dtpc);
-    //     return out;
-    // }
-
-    // // RLE+ADT (method_==2): mode runs coded as gamma run-length (same as RLE+FSE), but each non-mode
-    // // value uses the ADT transcode (Int2code class FSE'd + bucket-diff mantissa) instead of gamma.
-    // // Per-block FSE (FBLK-sized blocks, RLE+ADT2) on the value-class stream.
-    // size_t encode_rle_adt(const T *bins, size_t N, uchar *&bytes) {
-    //     const AdtTab &tab = adt_tab();
-    //     const T mode = (T)mode_;
-    //     uint8_t *rcl = (uint8_t *)malloc(N + 1), *vcl = (uint8_t *)malloc(N + 1);
-    //     uint8_t *rman = (uint8_t *)malloc(N + 16), *vman = (uint8_t *)malloc(2 * N + 16);
-    //     size_t nr = 0, nv = 0, rbp = 0, vbp = 0; uint64_t racc = 0, vacc = 0; int ran = 0, van = 0;
-    //     size_t i = 0;
-    //     while (i < N) {
-    //         size_t L = scan_run(bins, i, N, mode, scan_avx_); i += L;
-    //         uint64_t v = (uint64_t)L + 1; int k = 63 - __builtin_clzll(v); rcl[nr++] = (uint8_t)k;
-    //         racc = (racc << k) | (v & ((k < 64) ? ((1ull << k) - 1) : ~0ull)); ran += k;
-    //         while (ran >= 8) { ran -= 8; rman[rbp++] = (uint8_t)(racc >> ran); }
-    //         if (i >= N) break;
-    //         int code = (int)bins[i++];
-    //         if (code == -32768) { vcl[nv++] = 67; }                       // escape (unpredictable)
-    //         else {
-    //             uint16_t u = (uint16_t)code;
-    //             vcl[nv++] = tab.t2c[u]; int nb = tab.nb[u];
-    //             if (nb) { vacc = (vacc << nb) | tab.diff[u]; van += nb; while (van >= 8) { van -= 8; vman[vbp++] = (uint8_t)(vacc >> van); } }
-    //         }
-    //     }
-    //     if (ran > 0) rman[rbp++] = (uint8_t)(racc << (8 - ran));
-    //     if (van > 0) vman[vbp++] = (uint8_t)(vacc << (8 - van));
-
-    //     uint8_t *o_rcl = (uint8_t *)malloc(nr + nr / FBLK * 8 + 64);
-    //     uint8_t *o_vcl = (uint8_t *)malloc(nv + nv / FBLK * 8 + 64);
-    //     size_t s_rcl = fse_enc(rcl, nr, o_rcl), s_vcl = fse_enc(vcl, nv, o_vcl);
-
-    //     uchar *start = bytes;
-    //     write((uint64_t)nr, bytes); write((uint64_t)nv, bytes);
-    //     write((uint64_t)s_rcl, bytes); write((uint64_t)s_vcl, bytes);
-    //     write((uint64_t)rbp, bytes);  write((uint64_t)vbp, bytes);
-    //     memcpy(bytes, o_rcl, s_rcl); bytes += s_rcl;
-    //     memcpy(bytes, o_vcl, s_vcl); bytes += s_vcl;
-    //     memcpy(bytes, rman, rbp);    bytes += rbp;
-    //     memcpy(bytes, vman, vbp);    bytes += vbp;
-    //     free(rcl); free(vcl); free(rman); free(vman); free(o_rcl); free(o_vcl);
-    //     return (size_t)(bytes - start);
-    // }
-
-    // T *decode_rle_adt(const uchar *&bytes, size_t N) {
-    //     const T mode = (T)mode_;
-    //     uint64_t nr, nv, s_rcl, s_vcl, rbp, vbp;
-    //     read(nr, bytes); read(nv, bytes); read(s_rcl, bytes); read(s_vcl, bytes); read(rbp, bytes); read(vbp, bytes);
-    //     const uchar *o_rcl = bytes; bytes += s_rcl;
-    //     const uchar *o_vcl = bytes; bytes += s_vcl;
-    //     const uchar *rman = bytes;  bytes += rbp;
-    //     const uchar *vman = bytes;  bytes += vbp;
-    //     uint8_t *drcl = (uint8_t *)malloc(nr ? nr : 1), *dvcl = (uint8_t *)malloc(nv ? nv : 1);
-    //     fse_dec(o_rcl, nr, drcl); if (nv) fse_dec(o_vcl, nv, dvcl);
-    //     constexpr size_t pad = 64 / sizeof(T);
-    //     T *out = new T[N + pad];
-    //     size_t prod = 0, rrp = 0, vrp = 0, ri = 0, vi = 0; uint64_t rda = 0, vda = 0; int rdn = 0, vdn = 0;
-    //     while (prod < N) {
-    //         int k = drcl[ri++];
-    //         while (rdn < k) { rda = (rda << 8) | rman[rrp++]; rdn += 8; }
-    //         rdn -= k; uint64_t v = (1ull << k) | ((rda >> rdn) & ((k < 64) ? ((1ull << k) - 1) : ~0ull));
-    //         size_t L = (size_t)(v - 1);
-    //         if (L > N - prod) L = N - prod;
-    //         for (size_t j = 0; j < L; j++) out[prod++] = mode;
-    //         if (prod >= N) break;
-    //         int c = dvcl[vi++];
-    //         if (c == 67) { out[prod++] = (T)(-32768); continue; }         // escape
-    //         int base = code2int[c][0], nb = code2int[c][1], diff = 0;
-    //         if (nb) { while (vdn < nb) { vda = (vda << 8) | vman[vrp++]; vdn += 8; } vdn -= nb; diff = (int)((vda >> vdn) & ((1u << nb) - 1)); }
-    //         int factor = (c < 34) ? base + diff : base - diff;
-    //         out[prod++] = (T)factor;
-    //     }
-    //     free(drcl); free(dvcl);
-    //     return out;
-    // }
-
     // ---- order-1 model constants (context buckets + tANS byte alphabet) ----
     static constexpr int O1_NCTX = 15;
     static constexpr int O1T_PB = 13;
@@ -438,23 +269,6 @@ class RleFseEncoder : public concepts::EncoderInterface<T> {
         static const O1Lut t; 
         return t; 
     }
-
-    // static bool o1_fse_selftest() {
-    //     int16_t norm[2];
-    //     norm[0] = 1;
-    //     norm[1] = static_cast<int16_t>(O1T_M - 1);
-    //     FSE_CTable *ct = static_cast<FSE_CTable *>(malloc(FSE_CTABLE_SIZE_U32(O1T_PB, 1) * sizeof(FSE_CTable)));
-    //     size_t r = FSE_buildCTable(ct, norm, 1, O1T_PB);
-    //     free(ct);
-    //     if (FSE_isError(r)) {
-    //         std::fprintf(stderr,
-    //             "Falcons o1tans: FSE_buildCTable self-test failed: tableLog %d exceeds the linked FSE "
-    //             "build. This binary must compile the vendored zfse sources (see "
-    //             "tools/falcons/CMakeLists.txt), not resolve FSE_* from libzstd.\n", O1T_PB);
-    //         std::abort();
-    //     }
-    //     return true;
-    // }
 
     static void o1_normalize(const uint32_t *cnt, uint16_t *freq, int nsym = O1T_NSYM, int Mval = O1T_M) {
         uint64_t total = 0; 
@@ -540,6 +354,333 @@ class RleFseEncoder : public concepts::EncoderInterface<T> {
         }
     };
 
+    static constexpr unsigned BYTE_FSE_TABLE_LOG = 11;
+    static constexpr size_t BYTE_FSE_STREAMS = 4;
+    static constexpr size_t BYTE_FSE_LENGTHS = 2 * BYTE_FSE_STREAMS;
+
+    struct ByteFseWorkspace {
+        unsigned count[256];
+        short normalized[256];
+        FSE_CTable ctable[1537];
+        FSE_DTable dtable[2049];
+        unsigned scratch[1024];
+        uint8_t header[512];
+        uint8_t streams[BYTE_FSE_STREAMS][22560];
+    };
+    static_assert(sizeof(unsigned) == 4 && sizeof(short) == 2, "FSE ABI mismatch");
+    static_assert(sizeof(size_t) == 4 || sizeof(size_t) == 8, "unsupported FSE bit container size");
+    static_assert(sizeof(ByteFseWorkspace::ctable) >= FSE_CTABLE_SIZE(BYTE_FSE_TABLE_LOG, 255));
+    static_assert(sizeof(ByteFseWorkspace::dtable) >= FSE_DTABLE_SIZE(BYTE_FSE_TABLE_LOG));
+    static_assert(sizeof(ByteFseWorkspace::scratch) >= HIST_WKSP_SIZE);
+    static_assert(sizeof(ByteFseWorkspace::header) >= FSE_NCOUNTBOUND);
+    static_assert(sizeof(ByteFseWorkspace::streams[0]) >= (16384 * BYTE_FSE_TABLE_LOG + 7) / 8 + 16);
+
+    static void check_byte_fse(size_t result) {
+        if (FSE_isError(result)) throw std::runtime_error(FSE_getErrorName(result));
+    }
+
+    static size_t byte_split_bound(size_t count) {
+        const size_t blocks = count / FBLK + (count % FBLK != 0);
+        const size_t limit = static_cast<size_t>((std::numeric_limits<ptrdiff_t>::max)());
+        if (blocks > limit / 2 || count > (limit - 2 * blocks) / 2)
+            throw std::length_error("byte split output size overflow");
+        return 2 * count + 2 * blocks;
+    }
+
+    static void split_bytes(const T *input, size_t count, uint8_t *low, uint8_t *high) {
+        size_t i = 0;
+#ifdef __AVX2__
+        const __m256i mask = _mm256_set1_epi16(255);
+        for (; count - i >= 16; i += 16) {
+            const __m256i x = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(input + i));
+            const __m256i zz = _mm256_xor_si256(_mm256_slli_epi16(x, 1), _mm256_srai_epi16(x, 15));
+            const __m256i l = _mm256_and_si256(zz, mask);
+            const __m256i h = _mm256_srli_epi16(zz, 8);
+            _mm_storeu_si128(reinterpret_cast<__m128i *>(low + i),
+                _mm_packus_epi16(_mm256_castsi256_si128(l), _mm256_extracti128_si256(l, 1)));
+            _mm_storeu_si128(reinterpret_cast<__m128i *>(high + i),
+                _mm_packus_epi16(_mm256_castsi256_si128(h), _mm256_extracti128_si256(h, 1)));
+        }
+#endif
+        for (; i < count; ++i) {
+            const uint16_t x = static_cast<uint16_t>(input[i]);
+            const uint16_t zz = static_cast<uint16_t>((static_cast<unsigned>(x) << 1) ^ (0u - (x >> 15)));
+            low[i] = static_cast<uint8_t>(zz);
+            high[i] = static_cast<uint8_t>(zz >> 8);
+        }
+    }
+
+    static void join_bytes(const uint8_t *low, const uint8_t *high, size_t count, T *output) {
+        size_t i = 0;
+#ifdef __AVX2__
+        const __m256i one = _mm256_set1_epi16(1), zero = _mm256_setzero_si256();
+        for (; count - i >= 16; i += 16) {
+            const __m128i l = _mm_loadu_si128(reinterpret_cast<const __m128i *>(low + i));
+            const __m128i h = _mm_loadu_si128(reinterpret_cast<const __m128i *>(high + i));
+            const __m256i zz = _mm256_inserti128_si256(
+                _mm256_castsi128_si256(_mm_unpacklo_epi8(l, h)), _mm_unpackhi_epi8(l, h), 1);
+            const __m256i x = _mm256_xor_si256(_mm256_srli_epi16(zz, 1),
+                _mm256_sub_epi16(zero, _mm256_and_si256(zz, one)));
+            _mm256_storeu_si256(reinterpret_cast<__m256i *>(output + i), x);
+        }
+#endif
+        for (; i < count; ++i) {
+            const uint16_t zz = static_cast<uint16_t>(low[i] | (unsigned(high[i]) << 8));
+            const uint16_t x = static_cast<uint16_t>((zz >> 1) ^ (0u - (zz & 1u)));
+            output[i] = static_cast<T>(x);
+        }
+    }
+
+    // Each byte block is stored as RAW (0), FSE (1), or RLE (2).
+    static void encode_byte_stream(const uint8_t *src, size_t n, uint8_t *&out,
+                                   ByteFseWorkspace &ws) {
+        auto raw = [&] {
+            *out++ = 0;
+            std::memcpy(out, src, n);
+            out += n;
+        };
+        if (n < BYTE_FSE_STREAMS) {
+            if (n > 1 && std::all_of(src + 1, src + n, [src](uint8_t b) { return b == src[0]; })) {
+                *out++ = 2; *out++ = src[0];
+            } else raw();
+            return;
+        }
+
+        unsigned max_symbol = 255;
+        const size_t max_count = HIST_count_wksp(ws.count, &max_symbol, src, n,
+                                                  ws.scratch, sizeof(ws.scratch));
+        if (HIST_isError(max_count)) throw std::runtime_error("HIST_count_wksp failed");
+        if (max_count == n) { *out++ = 2; *out++ = src[0]; return; }
+        if (max_count == 1 || max_count < (n >> 7)) { raw(); return; }
+
+        const unsigned table_log = FSE_optimalTableLog(BYTE_FSE_TABLE_LOG, n, max_symbol);
+        const size_t normalized = FSE_normalizeCount(ws.normalized, table_log, ws.count, n, max_symbol);
+        check_byte_fse(normalized);
+        if (normalized != table_log) throw std::runtime_error("unexpected FSE normalization");
+        const size_t header_size = FSE_writeNCount(ws.header, sizeof(ws.header), ws.normalized,
+                                                   max_symbol, table_log);
+        check_byte_fse(header_size);
+        check_byte_fse(FSE_buildCTable_wksp(ws.ctable, ws.normalized, max_symbol, table_log,
+                                            ws.scratch, sizeof(ws.scratch)));
+
+        BIT_CStream_t bits[BYTE_FSE_STREAMS];
+        FSE_CState_t states[BYTE_FSE_STREAMS];
+        size_t offsets[BYTE_FSE_STREAMS];
+        const size_t quarter = n / BYTE_FSE_STREAMS, remainder = n % BYTE_FSE_STREAMS;
+        for (size_t i = 0; i < BYTE_FSE_STREAMS; ++i) {
+            offsets[i] = i * quarter + (std::min)(i, remainder);
+            check_byte_fse(BIT_initCStream(&bits[i], ws.streams[i], sizeof(ws.streams[i])));
+            FSE_initCState(&states[i], ws.ctable);
+            if (i < remainder) {
+                FSE_encodeSymbol(&bits[i], &states[i], src[offsets[i] + quarter]);
+                BIT_flushBits(&bits[i]);
+            }
+        }
+        auto encode_at = [&](size_t p) {
+            FSE_encodeSymbol(&bits[0], &states[0], src[offsets[0] + p]);
+            FSE_encodeSymbol(&bits[1], &states[1], src[offsets[1] + p]);
+            FSE_encodeSymbol(&bits[2], &states[2], src[offsets[2] + p]);
+            FSE_encodeSymbol(&bits[3], &states[3], src[offsets[3] + p]);
+        };
+        auto flush = [&] {
+            for (size_t i = 0; i < BYTE_FSE_STREAMS; ++i) BIT_flushBits(&bits[i]);
+        };
+        size_t p = quarter;
+        while (p >= 4) {
+            encode_at(--p); encode_at(--p);
+            // On 32-bit, two 11-bit symbols plus at most seven pending bits fit in size_t.
+            if constexpr (sizeof(size_t) == 4) flush();
+            encode_at(--p); encode_at(--p);
+            flush();
+        }
+        while (p) {
+            encode_at(--p);
+            if constexpr (sizeof(size_t) == 4) flush();
+        }
+
+        size_t lengths[BYTE_FSE_STREAMS], frame_size = BYTE_FSE_LENGTHS + header_size;
+        for (size_t i = 0; i < BYTE_FSE_STREAMS; ++i) {
+            FSE_flushCState(&bits[i], &states[i]);
+            lengths[i] = BIT_closeCStream(&bits[i]);
+            if (!lengths[i] || lengths[i] > 65535)
+                throw std::runtime_error("FSE stream buffer exhausted");
+            frame_size += lengths[i];
+        }
+        if (frame_size + sizeof(uint32_t) >= n) { raw(); return; }
+
+        *out++ = 1;
+        const uint32_t size = static_cast<uint32_t>(frame_size);
+        std::memcpy(out, &size, sizeof(size)); out += sizeof(size);
+        for (size_t i = 0; i < BYTE_FSE_STREAMS; ++i) {
+            *out++ = static_cast<uint8_t>(lengths[i]);
+            *out++ = static_cast<uint8_t>(lengths[i] >> 8);
+        }
+        std::memcpy(out, ws.header, header_size); out += header_size;
+        for (size_t i = 0; i < BYTE_FSE_STREAMS; ++i) {
+            std::memcpy(out, ws.streams[i], lengths[i]); out += lengths[i];
+        }
+    }
+
+    struct ReverseBits {
+        const uint8_t *data;
+        size_t pos;
+        uint64_t bits;
+        unsigned available;
+
+        ReverseBits(const uint8_t *p, size_t size) : data(p), pos(size - 1), bits(0), available(0) {
+            const unsigned last = p[size - 1];
+            if (!last) throw std::runtime_error("FSE stream has no end marker");
+            for (unsigned value = last; value > 1; value >>= 1) ++available;
+            bits = last & ((1u << available) - 1u);
+        }
+        bool ensure(unsigned needed) {
+            if (available < needed && pos >= 8) {
+                const unsigned take = (63u - available) / 8u;
+                const uint64_t word = MEM_readLE64(data + pos - 8);
+                bits = (bits << (take * 8)) | (word >> ((8 - take) * 8));
+                pos -= take;
+                available += take * 8;
+            }
+            while (available < needed && pos != 0) {
+                bits = (bits << 8) | data[--pos];
+                available += 8;
+            }
+            return available >= needed;
+        }
+        unsigned read_unchecked(unsigned count) {
+            available -= count;
+            return static_cast<unsigned>((bits >> available) & ((1u << count) - 1u));
+        }
+        unsigned read(unsigned count) {
+            if (!ensure(count)) throw std::runtime_error("truncated FSE stream");
+            return read_unchecked(count);
+        }
+        bool finished() const { return pos == 0 && available == 0; }
+    };
+
+    static void decode_byte_stream(const uint8_t *&in, size_t &remaining, size_t n, uint8_t *dst,
+                                   ByteFseWorkspace &ws) {
+        auto take = [&](size_t count) {
+            if (count > remaining) throw std::runtime_error("truncated byte split stream");
+            const uint8_t *p = in; in += count; remaining -= count; return p;
+        };
+        const uint8_t mode = *take(1);
+        if (mode == 0) { std::memcpy(dst, take(n), n); return; }
+        if (mode == 2) { std::memset(dst, *take(1), n); return; }
+        if (mode != 1) throw std::runtime_error("invalid byte split mode");
+
+        uint32_t frame_size;
+        std::memcpy(&frame_size, take(sizeof(frame_size)), sizeof(frame_size));
+        if (frame_size <= 1 || n <= sizeof(frame_size) || frame_size >= n - sizeof(frame_size))
+            throw std::runtime_error("invalid byte split FSE length");
+        const uint8_t *src = take(frame_size);
+        if (n < BYTE_FSE_STREAMS || n > FBLK || frame_size < BYTE_FSE_LENGTHS + BYTE_FSE_STREAMS + 1)
+            throw std::runtime_error("invalid FSE frame size");
+
+        size_t lengths[BYTE_FSE_STREAMS], payload_size = 0;
+        for (size_t i = 0; i < BYTE_FSE_STREAMS; ++i) {
+            lengths[i] = src[2 * i] | (static_cast<size_t>(src[2 * i + 1]) << 8);
+            if (!lengths[i] || lengths[i] > sizeof(ws.streams[i]))
+                throw std::runtime_error("invalid FSE stream length");
+            payload_size += lengths[i];
+        }
+        if (payload_size >= frame_size - BYTE_FSE_LENGTHS)
+            throw std::runtime_error("truncated FSE frame");
+        const size_t header_size = frame_size - BYTE_FSE_LENGTHS - payload_size;
+        if (header_size > sizeof(ws.header) ||
+            (src[BYTE_FSE_LENGTHS] & 15u) > BYTE_FSE_TABLE_LOG - FSE_MIN_TABLELOG)
+            throw std::runtime_error("invalid FSE model header");
+        unsigned max_symbol = 255, table_log = 0;
+        const size_t read = FSE_readNCount(ws.normalized, &max_symbol, &table_log,
+                                            src + BYTE_FSE_LENGTHS, frame_size - BYTE_FSE_LENGTHS);
+        check_byte_fse(read);
+        if (read != header_size || table_log < FSE_MIN_TABLELOG || table_log > BYTE_FSE_TABLE_LOG)
+            throw std::runtime_error("invalid FSE model size or tableLog");
+        unsigned total = 0, present = 0;
+        for (unsigned i = 0; i <= max_symbol; ++i) {
+            const int count = ws.normalized[i];
+            if (count < -1) throw std::runtime_error("invalid FSE normalized count");
+            if (count) ++present;
+            total += static_cast<unsigned>(count < 0 ? -count : count);
+        }
+        if (total != (1u << table_log) || present < 2)
+            throw std::runtime_error("invalid FSE normalized total");
+        check_byte_fse(FSE_buildDTable(ws.dtable, ws.normalized, max_symbol, table_log));
+
+        const uint8_t *payload = src + BYTE_FSE_LENGTHS + header_size;
+        ReverseBits b0(payload, lengths[0]); payload += lengths[0];
+        ReverseBits b1(payload, lengths[1]); payload += lengths[1];
+        ReverseBits b2(payload, lengths[2]); payload += lengths[2];
+        ReverseBits b3(payload, lengths[3]);
+        ReverseBits *bits[BYTE_FSE_STREAMS] = {&b0, &b1, &b2, &b3};
+        unsigned states[BYTE_FSE_STREAMS];
+        const auto *table = reinterpret_cast<const FSE_decode_t *>(ws.dtable + 1);
+        const unsigned table_size = 1u << table_log;
+        for (unsigned s = 0; s < table_size; ++s) {
+            const FSE_decode_t entry = table[s];
+            if (entry.nbBits > table_log ||
+                static_cast<unsigned>(entry.newState) + ((1u << entry.nbBits) - 1u) >= table_size)
+                throw std::runtime_error("invalid FSE transition table");
+        }
+        const size_t quarter = n / BYTE_FSE_STREAMS, remainder = n % BYTE_FSE_STREAMS;
+        size_t offsets[BYTE_FSE_STREAMS];
+        for (size_t i = 0; i < BYTE_FSE_STREAMS; ++i) {
+            offsets[i] = i * quarter + (std::min)(i, remainder);
+            states[i] = bits[i]->read(table_log);
+        }
+        auto decode_one = [&](size_t stream, size_t index) {
+            const FSE_decode_t entry = table[states[stream]];
+            dst[offsets[stream] + index] = entry.symbol;
+            states[stream] = entry.newState + bits[stream]->read(entry.nbBits);
+        };
+        auto decode_fast = [&](size_t stream, size_t index) {
+            const FSE_decode_t entry = table[states[stream]];
+            dst[offsets[stream] + index] = entry.symbol;
+            states[stream] = entry.newState + bits[stream]->read_unchecked(entry.nbBits);
+        };
+        size_t i = 0;
+        for (; quarter - i >= 4; i += 4) {
+            const unsigned need = 4 * table_log;
+            if (!b0.ensure(need) || !b1.ensure(need) || !b2.ensure(need) || !b3.ensure(need)) break;
+            for (unsigned j = 0; j < 4; ++j) {
+                decode_fast(0, i + j); decode_fast(1, i + j);
+                decode_fast(2, i + j); decode_fast(3, i + j);
+            }
+        }
+        for (; i < quarter; ++i) {
+            decode_one(0, i); decode_one(1, i); decode_one(2, i); decode_one(3, i);
+        }
+        for (size_t j = 0; j < remainder; ++j) decode_one(j, quarter);
+        for (size_t j = 0; j < BYTE_FSE_STREAMS; ++j)
+            if (states[j] != 0 || !bits[j]->finished())
+                throw std::runtime_error("invalid FSE stream ending");
+    }
+
+    static size_t encode_split_fse(const T *input, size_t count, uint8_t *&out,
+                                   uint8_t *low, uint8_t *high, ByteFseWorkspace &ws) {
+        (void)byte_split_bound(count);
+        uint8_t *const start = out;
+        for (size_t off = 0; off < count;) {
+            const size_t len = (std::min)(static_cast<size_t>(FBLK), count - off);
+            split_bytes(input + off, len, low, high);
+            encode_byte_stream(low, len, out, ws);
+            encode_byte_stream(high, len, out, ws);
+            off += len;
+        }
+        return static_cast<size_t>(out - start);
+    }
+
+    static void decode_split_fse(const uint8_t *&in, size_t &remaining, size_t count, T *output,
+                                 uint8_t *low, uint8_t *high, ByteFseWorkspace &ws) {
+        for (size_t off = 0; off < count;) {
+            const size_t len = (std::min)(static_cast<size_t>(FBLK), count - off);
+            decode_byte_stream(in, remaining, len, low, ws);
+            decode_byte_stream(in, remaining, len, high, ws);
+            join_bytes(low, high, len, output + off);
+            off += len;
+        }
+    }
+
     static constexpr size_t RLE_ALIGNMENT = 64;
     struct RleBuffers {
         uint8_t *rcl, *vcl, *rman, *vman;
@@ -575,11 +716,14 @@ class RleFseEncoder : public concepts::EncoderInterface<T> {
 
     struct EncodeWorkspace {
         EncodeBuffer<uint8_t> rle_slab;
+        EncodeBuffer<uint8_t> byte_low, byte_high;
+        std::unique_ptr<ByteFseWorkspace> byte_fse;
         // Overflow scratch must not reallocate the live RLE slab or tANS streams.
         EncodeBuffer<uint8_t> vcl, vman, ovf_classes, fse_tmp, streams;
         EncodeBuffer<int16_t> ovf;
         EncodeBuffer<FSE_CTable> ct;
         EncodeBuffer<FSE_symbolCompressionTransform> flat_tt;
+        EncodeBuffer<uint32_t> histogram_counts;
 #ifdef __AVX2__
         uint16_t prepared_indices[O1T_K][O1T_TILE];
 #endif
@@ -587,6 +731,11 @@ class RleFseEncoder : public concepts::EncoderInterface<T> {
         uint16_t nf[O1_NCTX * O1T_NSYM];
         uint16_t table_freq[O1_NCTX * O1T_NSYM];
         bool table_valid[O1_NCTX] = {};
+
+        ByteFseWorkspace &byte_fse_workspace() {
+            if (!byte_fse) byte_fse.reset(new ByteFseWorkspace);
+            return *byte_fse;
+        }
 
         RleBuffers rle_buffers(size_t n) {
             const RleLayout layout = rle_layout(n);
@@ -653,6 +802,58 @@ class RleFseEncoder : public concepts::EncoderInterface<T> {
             indices[i] = O1T_NSYM * L.ctx[static_cast<uint16_t>((current + i)[-1])] +
                          L.sym256[static_cast<uint16_t>(current[i])];
     }
+
+    // Keep transition state in registers, separate from histogram and tile preparation.
+    FORCE_NOINLINE void o1_encode_tile(BIT_CStream_t *bc, FSE_CState_t *cst,
+                                      const U16 *state_table,
+                                      const FSE_symbolCompressionTransform *transforms,
+                                      const uint16_t (*indices)[O1T_TILE], size_t jj) {
+        assert(jj > 1);
+        const size_t count = std::min(O1T_TILE, jj - 1);
+        const unsigned phase = static_cast<unsigned>(jj - count) & 3;
+        U32 s0 = static_cast<U32>(cst[0].value), s1 = static_cast<U32>(cst[1].value);
+        U32 s2 = static_cast<U32>(cst[2].value), s3 = static_cast<U32>(cst[3].value);
+        size_t b0 = bc[0].bitContainer, b1 = bc[1].bitContainer;
+        size_t b2 = bc[2].bitContainer, b3 = bc[3].bitContainer;
+        unsigned p0 = bc[0].bitPos, p1 = bc[1].bitPos, p2 = bc[2].bitPos, p3 = bc[3].bitPos;
+        char *o0 = bc[0].ptr, *o1 = bc[1].ptr, *o2 = bc[2].ptr, *o3 = bc[3].ptr;
+        const auto step = [=](U32 &state, size_t &bits, unsigned &pos, unsigned index) {
+            const FSE_symbolCompressionTransform tt = transforms[index];
+            assert(state >= O1T_M && state < 2 * O1T_M);
+            const U32 nb = (state + tt.deltaNbBits) >> 16;
+            assert(nb <= O1T_PB && nb + pos < sizeof(bits) * 8);
+            bits |= (static_cast<size_t>(state) & BIT_mask[nb]) << pos;
+            pos += nb;
+            state = state_table[static_cast<ptrdiff_t>(state >> nb) + tt.deltaFindState];
+        };
+        const auto flush = [](size_t &bits, unsigned &pos, char *&out, char *end) {
+            const unsigned bytes = pos >> 3;
+            assert(pos < sizeof(bits) * 8 && out <= end);
+            MEM_writeLEST(out, bits);
+            out += bytes;
+            if (out > end) out = end;
+            bits >>= bytes * 8;
+            pos &= 7;
+        };
+        for (size_t t = count; t > 0;) {
+            --t;
+            step(s0, b0, p0, indices[0][t]);
+            step(s1, b1, p1, indices[1][t]);
+            step(s2, b2, p2, indices[2][t]);
+            step(s3, b3, p3, indices[3][t]);
+            if (((t + phase) & 3) == 0) {
+                flush(b0, p0, o0, bc[0].endPtr);
+                flush(b1, p1, o1, bc[1].endPtr);
+                flush(b2, p2, o2, bc[2].endPtr);
+                flush(b3, p3, o3, bc[3].endPtr);
+            }
+        }
+        cst[0].value = s0; cst[1].value = s1; cst[2].value = s2; cst[3].value = s3;
+        bc[0].bitContainer = b0; bc[0].bitPos = p0; bc[0].ptr = o0;
+        bc[1].bitContainer = b1; bc[1].bitPos = p1; bc[1].ptr = o1;
+        bc[2].bitContainer = b2; bc[2].bitPos = p2; bc[2].ptr = o2;
+        bc[3].bitContainer = b3; bc[3].bitPos = p3; bc[3].ptr = o3;
+    }
 #endif
 
     // ---- Generic K-stream context-switching tANS (method_==1) ----
@@ -662,6 +863,14 @@ class RleFseEncoder : public concepts::EncoderInterface<T> {
         uchar *sb = bytes;
         if (n == 0) {
             write(static_cast<uint8_t>(0), bytes);
+            return bytes - sb;
+        }
+        // Every escape has at least one mantissa byte, so the headers alone
+        // make a compressed candidate no smaller than raw for n <= 16.
+        if (n <= 2 * sizeof(uint64_t)) {
+            write(static_cast<uint8_t>(0), bytes);
+            memcpy(bytes, ovf, n * sizeof(int16_t));
+            bytes += n * sizeof(int16_t);
             return bytes - sb;
         }
 
@@ -680,7 +889,11 @@ class RleFseEncoder : public concepts::EncoderInterface<T> {
             vcl[i] = static_cast<uint8_t>(vk);
             vacc = (vacc << vk) | (vv & ((1ull << vk) - 1));
             van += vk;
-            while (van >= 8) {
+            // Escapes have 8 <= vk <= 16, with at most seven carry bits.
+            assert(vk >= 8 && vk <= 16);
+            van -= 8;
+            vman[vbp++] = static_cast<uint8_t>(vacc >> van);
+            if (van >= 8) {
                 van -= 8;
                 vman[vbp++] = static_cast<uint8_t>(vacc >> van);
             }
@@ -756,7 +969,7 @@ class RleFseEncoder : public concepts::EncoderInterface<T> {
     // Quant statistics drift along the stream (levels, passes, level-wise eb), so one global
     // table set is a compromise: per-segment tables measured ~2-3% tighter payload at identical
     // per-symbol cost. Each segment is a self-contained block (own tables, K streams, escapes).
-    size_t encode_o1tans(const T *bins, size_t N, uchar *&bytes) {
+    size_t encode_h1fse(const T *bins, size_t N, uchar *&bytes) {
         uchar *sb = bytes;
         size_t S = N / O1T_SEG;
         if (S < 1) S = 1;
@@ -766,12 +979,12 @@ class RleFseEncoder : public concepts::EncoderInterface<T> {
         for (size_t g = 0; g < S; g++) {
             size_t lo = g * seg, hi = lo + seg;
             if (hi > N) hi = N;
-            encode_o1tans_block(bins + lo, hi - lo, bytes);
+            encode_h1fse_block(bins + lo, hi - lo, bytes);
         }
         return static_cast<size_t>(bytes - sb);
     }
 
-    size_t encode_o1tans_block(const T *bins, size_t N, uchar *&bytes) {
+    size_t encode_h1fse_block(const T *bins, size_t N, uchar *&bytes) {
         const O1Lut &L = o1_lut();
         uchar *sb = bytes;
         // if (N == 0) { 
@@ -788,12 +1001,40 @@ class RleFseEncoder : public concepts::EncoderInterface<T> {
         memset(cnt, 0, sizeof(ws.cnt));
         //std::getenv("FALCONS_TANS_FULLHIST") || 
         if (N < (1u << 20)) {       // exact full per-context histogram (opt-out via env / small N); default = fast sampled path below
+            const size_t total = O1_NCTX * O1T_NSYM;
+            uint32_t *cnt1 = nullptr, *cnt2 = nullptr, *cnt3 = nullptr;
+            if (N >= (1u << 15)) {
+                cnt1 = ws.histogram_counts.get(3 * total);
+                cnt2 = cnt1 + total;
+                cnt3 = cnt2 + total;
+                memset(cnt1, 0, 3 * total * sizeof(*cnt1));
+            }
             for (int k = 0; k < O1T_K; k++) { 
                 size_t lo = cs * k, hi = lo + cs; 
                 if (hi > N) 
                     hi = N;
                 uint16_t prev = 0;
-                for (size_t i = lo; i < hi; i++) { 
+                size_t i = lo;
+                if (cnt1) {
+                    for (; i + 4 <= hi; i += 4) {
+                        const uint16_t c0 = static_cast<uint16_t>(bins[i]);
+                        const uint16_t c1 = static_cast<uint16_t>(bins[i + 1]);
+                        const uint16_t c2 = static_cast<uint16_t>(bins[i + 2]);
+                        const uint16_t c3 = static_cast<uint16_t>(bins[i + 3]);
+                        const unsigned s0 = L.sym256[c0], s1 = L.sym256[c1];
+                        const unsigned s2 = L.sym256[c2], s3 = L.sym256[c3];
+                        cnt[O1T_NSYM * L.ctx[prev] + s0]++;
+                        cnt1[O1T_NSYM * L.ctx[c0] + s1]++;
+                        cnt2[O1T_NSYM * L.ctx[c1] + s2]++;
+                        cnt3[O1T_NSYM * L.ctx[c2] + s3]++;
+                        if (s0 == O1T_NSYM - 1) { ovf[novf++] = c0; novf_k[k]++; }
+                        if (s1 == O1T_NSYM - 1) { ovf[novf++] = c1; novf_k[k]++; }
+                        if (s2 == O1T_NSYM - 1) { ovf[novf++] = c2; novf_k[k]++; }
+                        if (s3 == O1T_NSYM - 1) { ovf[novf++] = c3; novf_k[k]++; }
+                        prev = c3;
+                    }
+                }
+                for (; i < hi; i++) {
                     uint16_t code = bins[i];
                     int c = L.ctx[prev];
                     int s = L.sym256[code];
@@ -805,18 +1046,52 @@ class RleFseEncoder : public concepts::EncoderInterface<T> {
                     prev = code; 
                 } 
             }
+            if (cnt1)
+                for (size_t t = 0; t < total; ++t)
+                    cnt[t] += cnt1[t] + cnt2[t] + cnt3[t];
         } else {                                                        // fast: full escape scan + windowed-sample histogram
+#ifdef __AVX2__
+            const __m256i min_code = _mm256_set1_epi16(-127);
+            const __m256i max_code = _mm256_set1_epi16(127);
+#endif
             for (int k = 0; k < O1T_K; k++) { 
                 size_t lo = cs * k, hi = lo + cs; 
                 if (hi > N) 
                     hi = N; 
-                size_t b0 = novf;  // escapes: branchless
-                for (size_t i = lo; i < hi; i++) { 
+                size_t b0 = novf;
+                size_t i = lo;
+#ifdef __AVX2__
+                // Escape is exactly outside [-127, 127]; process each stream in order.
+                for (; i + 16 <= hi; i += 16) {
+                    const __m256i values = _mm256_loadu_si256(
+                        reinterpret_cast<const __m256i *>(bins + i));
+                    const __m256i escapes = _mm256_or_si256(
+                        _mm256_cmpgt_epi16(min_code, values), _mm256_cmpgt_epi16(values, max_code));
+                    uint32_t mask = static_cast<uint32_t>(_mm256_movemask_epi8(escapes));
+                    if (mask == 0) continue;
+                    if (mask == 0xFFFFFFFFu) {
+                        _mm256_storeu_si256(reinterpret_cast<__m256i *>(ovf + novf), values);
+                        novf += 16;
+                    } else {
+                        mask &= 0x55555555u;
+                        do {
+                            const unsigned lane = static_cast<unsigned>(__builtin_ctz(mask)) >> 1;
+                            ovf[novf++] = bins[i + lane];
+                            mask &= mask - 1;
+                        } while (mask);
+                    }
+                }
+#endif
+                for (; i < hi; i++) {
                     ovf[novf] = bins[i];
                     novf += (L.sym256[static_cast<uint16_t>(bins[i])] == O1T_NSYM - 1);
                 }
                 novf_k[k] = novf - b0; 
             }
+            const size_t total = O1_NCTX * O1T_NSYM;
+            uint32_t *cnt1 = ws.histogram_counts.get(3 * total);
+            uint32_t *cnt2 = cnt1 + total, *cnt3 = cnt2 + total;
+            memset(cnt1, 0, 3 * total * sizeof(*cnt1));
             size_t nwin = 2048, wlen = 512;                             // ~1M windowed pairs per block; prev exact within each window
             size_t step = N / nwin; 
             if (step < wlen) 
@@ -826,15 +1101,28 @@ class RleFseEncoder : public concepts::EncoderInterface<T> {
                 size_t we = w + wlen; 
                 if (we > N) 
                     we = N;
-                for (size_t i = w; i < we; i++) { 
+                size_t i = w;
+                for (; i + 4 <= we; i += 4) {
+                    const uint16_t c0 = static_cast<uint16_t>(bins[i]);
+                    const uint16_t c1 = static_cast<uint16_t>(bins[i + 1]);
+                    const uint16_t c2 = static_cast<uint16_t>(bins[i + 2]);
+                    const uint16_t c3 = static_cast<uint16_t>(bins[i + 3]);
+                    cnt[O1T_NSYM * L.ctx[static_cast<uint16_t>(prev)] + L.sym256[c0]]++;
+                    cnt1[O1T_NSYM * L.ctx[c0] + L.sym256[c1]]++;
+                    cnt2[O1T_NSYM * L.ctx[c1] + L.sym256[c2]]++;
+                    cnt3[O1T_NSYM * L.ctx[c2] + L.sym256[c3]]++;
+                    prev = bins[i + 3];
+                }
+                for (; i < we; i++) {
                     int code = bins[i];
                     cnt[static_cast<size_t>(O1T_NSYM) * L.ctx[static_cast<uint16_t>(prev)] + L.sym256[static_cast<uint16_t>(code)]]++;
                     prev = code; 
                 } 
             }
-            size_t total = O1_NCTX * O1T_NSYM;
-            for (size_t t = 0; t < total; t++) 
+            for (size_t t = 0; t < total; t++) {
+                cnt[t] += cnt1[t] + cnt2[t] + cnt3[t];
                 cnt[t]++;   // Laplace +1: no zero-freq -> any real symbol stays encodable
+            }
         }
         
         uint16_t *nf = ws.nf;
@@ -938,17 +1226,8 @@ class RleFseEncoder : public concepts::EncoderInterface<T> {
                 const size_t begin = jj - count;
                 for (int k = 0; k < O1T_K; ++k)
                     o1_prepare_indices(bins + k * cs + begin, count, ws.prepared_indices[k], L);
-                for (size_t t = count; t > 0;) {
-                    --t;
-                    --jj;
-                    o1_encode_symbol(bc[0], cst[0], encode_st, encode_tt, ws.prepared_indices[0][t]);
-                    o1_encode_symbol(bc[1], cst[1], encode_st, encode_tt, ws.prepared_indices[1][t]);
-                    o1_encode_symbol(bc[2], cst[2], encode_st, encode_tt, ws.prepared_indices[2][t]);
-                    o1_encode_symbol(bc[3], cst[3], encode_st, encode_tt, ws.prepared_indices[3][t]);
-                    if ((jj & 3) == 0)
-                        for (int k = 0; k < O1T_K; ++k)
-                            BIT_flushBits(&bc[k]);
-                }
+                o1_encode_tile(bc, cst, encode_st, encode_tt, ws.prepared_indices, jj);
+                jj = begin;
             }
             const uint16_t s0 = bins[0], s1 = bins[cs], s2 = bins[2 * cs], s3 = bins[3 * cs];
 #else
@@ -1007,7 +1286,7 @@ class RleFseEncoder : public concepts::EncoderInterface<T> {
         return (bytes - sb);
     }
 
-    T *decode_o1tans(const uchar *&bytes, size_t N) {
+    T *decode_h1fse(const uchar *&bytes, size_t N) {
         constexpr size_t pad = 64 / sizeof(T); 
         T *out = new T[N + pad];
 #if defined(__linux__)
@@ -1023,12 +1302,12 @@ class RleFseEncoder : public concepts::EncoderInterface<T> {
         for (size_t g = 0; g < S; g++) {
             size_t lo = g * seg, hi = lo + seg;
             if (hi > N) hi = N;
-            decode_o1tans_block(bytes, hi - lo, out + lo);
+            decode_h1fse_block(bytes, hi - lo, out + lo);
         }
         return out;
     }
 
-    void decode_o1tans_block(const uchar *&bytes, size_t N, T *out) {
+    void decode_h1fse_block(const uchar *&bytes, size_t N, T *out) {
         uint64_t n_, Kk;
         read(n_, bytes);
         read(Kk, bytes);
@@ -1104,11 +1383,13 @@ class RleFseEncoder : public concepts::EncoderInterface<T> {
     // Model flags copy, but mutable scratch and cached tables remain object-private.
     RleFseEncoder(const RleFseEncoder &other)
         : lo_(other.lo_), mode_(other.mode_), method_(other.method_),
-          use_delta_(other.use_delta_), scan_simd_(other.scan_simd_) {}
+          use_delta_(other.use_delta_), scan_simd_(other.scan_simd_),
+          decode_remaining_(other.decode_remaining_) {}
     RleFseEncoder &operator=(const RleFseEncoder &other) {
         if (this != &other) {
             lo_ = other.lo_; mode_ = other.mode_; method_ = other.method_;
             use_delta_ = other.use_delta_; scan_simd_ = other.scan_simd_;
+            decode_remaining_ = other.decode_remaining_;
             workspace_.reset();
         }
         return *this;
@@ -1123,7 +1404,7 @@ class RleFseEncoder : public concepts::EncoderInterface<T> {
     void preprocess_encode(const T *bins, size_t num_bin, int stateNum) {
         // static const bool fse_ok = o1_fse_selftest();   // link self-test (tableLog vs linked FSE); uncomment to re-arm
         // (void)fse_ok;
-        // (void)stateNum;
+        (void)stateNum;
         mode_ = 0; lo_ = 0;
         // ONE windowed sample (256 windows x 32 contiguous) -> two signals:
         //   p0     = fraction(code==mode)        : long-run-ness (RLE friendliness)
@@ -1139,6 +1420,7 @@ class RleFseEncoder : public concepts::EncoderInterface<T> {
         size_t step = (num_bin > NW * WL) ? (num_bin - WL) / NW : WL; 
         if (!step) step = 1;
         size_t z = 0, zd = 0, cnt = 0, cntd = 0;
+        size_t raw_escapes = 0;
         for (size_t w = 0; w < NW; w++) {
             size_t off = w * step; 
             if (off + WL > num_bin) 
@@ -1146,6 +1428,9 @@ class RleFseEncoder : public concepts::EncoderInterface<T> {
             T prev = bins[off];
             for (size_t t = 0; t < WL; t++) {
                 T x = bins[off + t];
+                const uint16_t raw_bits = static_cast<uint16_t>(x);
+                const int raw = raw_bits < 32768 ? int(raw_bits) : int(raw_bits) - 65536;
+                raw_escapes += raw < -127 || raw > 127;
                 if (x == mode) 
                     z++;
                 if (t > 0 && x == prev) 
@@ -1164,7 +1449,10 @@ class RleFseEncoder : public concepts::EncoderInterface<T> {
         // table-free RLE+FSE path (method 0) is both smaller AND can't overflow the compress
         // buffer (which is sized from the input), so fall back to it.
         if (num_bin < static_cast<size_t>(20) * O1_NCTX * O1T_NSYM) method_ = 0;
-        scan_simd_ = (p0 >= 0.85);
+        const double scan_p0 = use_delta_ && cntd ? 1.0 * zd / cntd : p0;
+        scan_simd_ = (scan_p0 >= 0.85);
+        if (method_ == 1 && cnt && raw_escapes >= cnt - cnt / 2)
+            method_ = 2;
     }
 
     size_t encode(const T *bins0, size_t N, uchar *&bytes) {
@@ -1194,7 +1482,12 @@ class RleFseEncoder : public concepts::EncoderInterface<T> {
             for (; i > 1; i--) a[i - 1] = static_cast<T>(a[i - 1] - a[i - 2]);   // a[0] stays as seed
             bins = a;
         }
-        if (method_ == 1) return encode_o1tans(bins, N, bytes);   // 1 = order1-tANS
+        if (method_ == 2) {
+            EncodeWorkspace &ws = encode_workspace();
+            return encode_split_fse(bins, N, bytes, ws.byte_low.get(FBLK),
+                                    ws.byte_high.get(FBLK), ws.byte_fse_workspace());
+        }
+        if (method_ == 1) return encode_h1fse(bins, N, bytes);   // 1 = order1-tANS
         // if (method_ == 2) return encode_rle_adt(bins, N, bytes);  // 2 = RLE+ADT2+zstd
         // if (method_ == 3) return encode_adt(bins, N, bytes);      // 3 = ADT2+zstd (noRLE)
         // method_ == 0 -> RLE+FSE+zstd (fallthrough)
@@ -1266,7 +1559,17 @@ class RleFseEncoder : public concepts::EncoderInterface<T> {
         T *out;
         // static const bool fse_ok = o1_fse_selftest();   // link self-test (tableLog vs linked FSE); uncomment to re-arm
         // (void)fse_ok;
-        if (method_ == 1) out = decode_o1tans(bytes, N);
+        if (method_ == 2) {
+            constexpr size_t pad = 64 / sizeof(T);
+            if (N > (std::numeric_limits<size_t>::max)() / sizeof(T) - pad)
+                throw std::length_error("byte split decoded size overflow");
+            std::unique_ptr<T[]> decoded(new T[N + pad]);
+            EncodeWorkspace &ws = encode_workspace();
+            decode_split_fse(bytes, decode_remaining_, N, decoded.get(), ws.byte_low.get(FBLK),
+                             ws.byte_high.get(FBLK), ws.byte_fse_workspace());
+            std::fill_n(decoded.get() + N, pad, T{});
+            out = decoded.release();
+        } else if (method_ == 1) out = decode_h1fse(bytes, N);
         // else if (method_ == 2) out = decode_rle_adt(bytes, N);
         // else if (method_ == 3) out = decode_adt(bytes, N);
         else {
@@ -1355,8 +1658,11 @@ class RleFseEncoder : public concepts::EncoderInterface<T> {
         write(lo_, c); write(mode_, c);
     }
     void load(const uchar *&c, size_t &remaining_length) override {
+        if (remaining_length < sizeof(uint8_t) + 2 * sizeof(uint16_t))
+            throw std::runtime_error("truncated entropy header");
         read(method_, c, remaining_length); use_delta_ = (method_ & 0x80) != 0; method_ &= 0x7F;
         read(lo_, c, remaining_length); read(mode_, c, remaining_length);
+        decode_remaining_ = remaining_length;
     }
 
     void preprocess_encode(const std::vector<T> &bins, int stateNum) override {

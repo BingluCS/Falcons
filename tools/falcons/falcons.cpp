@@ -134,7 +134,7 @@ template <class T>
 void compress(char *inPath, char *cmpPath, Falcons::Config &conf) {
     T *data = new T[conf.num];
     Falcons::readfile<T>(inPath, conf.num, data);
-    size_t bytesCap = 2 * conf.num * sizeof(T);
+    size_t bytesCap = Falcons::Falcons_compress_size_bound<T>(conf);
     auto bytes = new char[bytesCap];
 
     Falcons::Timer timer(true);
