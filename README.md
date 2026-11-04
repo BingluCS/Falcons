@@ -75,6 +75,7 @@ max_err, psnr, nrmse    = falcons.verify(data, decompressed.reshape(data.shape))
 * The wheel builds Falcons from source (with bundled Zstd). For a source build, `setup.py` **auto-detects the build machine's SIMD** — `-march=native` enables AVX2 on x86 and SVE2 on ARM, and stays scalar otherwise. Set `PYFALCONS_SIMD` to force a target (`avx2`, `sve2`, `native`, `none`, or a custom `-march=…`); see [`tools/pyfalcons/README.md`](tools/pyfalcons/README.md) for details.
 
 ### HDF5 filter (H5Z-Falcons)
+* For C/C++, h5py, and DataLoader setup and examples, see the [H5Z-Falcons guide](tools/H5Z-Falcons/README.md).
 * Located in `tools/H5Z-Falcons`; library target `hdf5falcons`. Build with `-DBUILD_H5Z_FILTER=ON` (requires HDF5).
 * Add `-DENABLE_AVX2=ON` to vectorize the compression that runs *inside* the filter — the filter's CMake sets the SIMD flags explicitly, so it is AVX2/SVE2-accelerated just like the rest of Falcons.
 * `falconsToHDF5` and `HDF5ToFalcons` (under `tools/H5Z-Falcons/test`) are provided for testing — e.g. `falconsToHDF5 -f data.dat 100 100 100` writes `data.dat.falcons.h5`, and `HDF5ToFalcons data.dat.falcons.h5` reconstructs it. The type flag is `-f` (float), `-d` (double), or `-i8/-u8/-i16/-u16/-i32/-u32/-i64/-u64` for integers.

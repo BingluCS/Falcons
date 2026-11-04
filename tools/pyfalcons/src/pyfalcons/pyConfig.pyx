@@ -1,8 +1,12 @@
 # distutils: language = c++
 """Python wrapper for Falcons Config class."""
 
+from builtins import bool as py_bool
+from numbers import Integral
+
 from pyfalcons cimport pyConfig
 cimport cython
+from libc.limits cimport INT_MAX
 
 
 cdef class falconsConfig:
@@ -48,6 +52,52 @@ cdef class falconsConfig:
             self.conf.loadcfg(cfgpathStr)
         except RuntimeError as e:
             raise RuntimeError(f"Failed to load '{cfgpath}': {e}")
+
+    def h5py_options(self, num_threads=None):
+        """Return h5py filter kwargs using the fields saved by Config::save.
+
+        A copy is serialized with placeholder dimensions (1,), which also
+        resets blockSize and predDim. The HDF5 filter replaces those fields and
+        data type from the dataset and its chunks. An optional positive
+        num_threads is appended for the filter's compression runtime and does
+        not enable OpenMP. Interpolation settings are not saved by Config::save.
+        Combined ABS/REL bounds are not supported for HDF5 round trips.
+        """
+        cdef Config filter_conf
+        cdef size_t byte_count
+        cdef size_t word_count
+        cdef vector[size_t] placeholder_dims
+        cdef vector[uint32_t] cd_values
+        cdef unsigned char *buffer
+
+        if num_threads is not None:
+            if isinstance(num_threads, py_bool) or not isinstance(num_threads, Integral):
+                raise TypeError("num_threads must be a positive integer or None")
+            num_threads = int(num_threads)
+            if num_threads <= 0 or num_threads > INT_MAX:
+                raise ValueError("num_threads must be in the range 1 to C++ INT_MAX")
+
+        if self.conf.errorBoundMode > 5 or self.conf.cmprAlgo > 4:
+            raise ValueError("Invalid Falcons error bound mode or compression algorithm")
+        if self.conf.errorBoundMode in (4, 5):
+            raise ValueError(
+                "The current Falcons compressor does not support HDF5 round trips "
+                "with ABS_AND_REL or ABS_OR_REL"
+            )
+
+        filter_conf = self.conf
+        placeholder_dims.push_back(1)
+        filter_conf.setDims(placeholder_dims.begin(), placeholder_dims.end())
+        byte_count = filter_conf.size_est()
+        word_count = (byte_count + sizeof(uint32_t) - 1) // sizeof(uint32_t)
+
+        cd_values.resize(word_count)
+        buffer = <unsigned char *>cd_values.data()
+        byte_count = filter_conf.save(buffer)
+        cd_values.resize((byte_count + sizeof(uint32_t) - 1) // sizeof(uint32_t))
+        if num_threads is not None:
+            cd_values.push_back(<uint32_t>num_threads)
+        return {"compression": 40024, "compression_opts": tuple(cd_values)}
     
     # Read-only properties
     @property
